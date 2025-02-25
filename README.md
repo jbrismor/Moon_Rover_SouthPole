@@ -1,1 +1,3 @@
 # Moon_Rover_SouthPole
+
+The proposed project is the first step towards the full automation of the Moon Rover Explorations on the South Pole. The goal is to develop a system that can safely navigate the Moon's surface while getting to its desired destination. The system will be developed using the terrain data from the South Pole of the Moon collected by LOLA, specifically the file LDEM_80S_20MPP_ADJ.TIF found here: https://pgda.gsfc.nasa.gov/products/90.

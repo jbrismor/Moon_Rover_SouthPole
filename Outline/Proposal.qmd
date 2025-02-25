@@ -1,0 +1,76 @@
+---
+title: 'Safe Automation on Moon Rover Exploration'
+authors:
+  - Jorge Bris Moreno
+  - Billy McGloin
+  - James Hickman
+format:
+  html:
+    toc: true
+    embed-resources: true
+---
+
+## Introduction
+
+The proposed project is the first step towards the full automation of the Moon Rover Explorations on the South Pole. The goal is to develop a system that can safely navigate the Moon's surface while getting to its desired destination. The system will be developed using the terrain data from the South Pole of the Moon collected by LOLA, specifically the file LDEM_80S_20MPP_ADJ.TIF found here: https://pgda.gsfc.nasa.gov/products/90. The system creation will follow different checkpoints explained below to ensure its safety and reliability.
+
+As mentioned, this algorithm proposes to automate the displacement of rovers on the Moon's South Pole by taking real-time actions and decisions. Further development will come in future work for the proper handle of a battery system with the ultimate goal of combining these two systems to create a fully autonomous rover with a Multi-layer RL algorithm.
+
+**Notes:** Since we are handpicking the destination location, it has to be a reachable location. To do so we do the following:
+
+1. We use the A* algorithm to find the shortest path to the destination.
+2. We add a slope constraint (under 25 degrees) to the A* algorithm to ensure that the path is safe.
+3. For each cell, the algorithm check the next 8 cells, and for valid cells, it continues to check the next 8 cells until it finds a valid path to the destination. This ensures that the destination is reachable when set.
+
+## Checkpoint 1: Path Planning (destination is always fixed)
+
+The first step in the development of this system will involve utilizing the terrain data with no additional information. Here, we will use this data to find the shortest and safest (meaning it has slopes of less than 25 degrees) path to the destination by leveraging the A* algorithm. At this point, we will train an RL algorithm to get to that destination and contrast the results with one another, looking at their main differences in pathfinding and time to reach the destination to make improvements.
+
+**Agent information, movement, and failure:**
+
+- Agent information: current position, current inclination, surrounding inclination.
+- Actions: Move foward and full 360 degree turn.
+- Failure: The rover crashes if it goes through a slope greater than 25 degrees.
+
+## Checkpoint 2: Obstacles and failure Addition (destination is always fixed)
+
+Once the RL solver works for 1, we will still use the safe shortest path as a baseline for this step. However, here we will add obstacles (rocks) to the terrain that the rover may or may not perceive based on a probability (mimicking sensor errors). The rover will receive a negative reward if it crashes into an obstacle and it will be considered a crash after X number of crashes. 
+
+Additionally, tilting over will not be deterministic anymore. Instead, it will be safe to run the rover on slopes up to 27 degrees, and then the probability of tilting will follow a sigmoidal function from 27 degrees to 35 degrees, where at 37 degrees the probability of tilting is 1.
+
+**Agent information, movement, and failure:**
+
+- Agent information: current position, current inclination, surrounding inclination, surrounding rocks (with probability of being perceived).
+- Actions: Move foward and full 360 degree turn.
+- Failure: The rover crashes if it tilts or runs into X number of rocks.
+
+## Checkpoint 3: Acceleration (destination is always fixed)
+
+At this point, we will add an additional layer of complexity to the rover's actions. The rover will now be able to accelerate and decelerate which should correlate with the terrain inclination. (Add more details here)
+
+**Agent information, movement, and failure:**
+
+- Agent information: current position, current inclination, surrounding inclination, surrounding rocks (with probability of being perceived).
+- Actions: Accelerate (continuous), decelerate (continuous), and full 360 degree turn.
+- Failure: The rover crashes if it tilts or runs into X number of rocks.
+
+## Checkpoint 4: Input noise (destination is always fixed)
+
+In this step, we will add noise to the rover's inputs to simulate sensor errors. This will make the rover's perception of its surroundings less accurate and will require it to rely more on its own actions and decisions. The noise will be added to the rover's position, and surrounding inclination. Everything else will remain the same as in the previous checkpoint.
+
+## Checkpoint 5: Different Destinations
+
+At this point, we will have a fully functional rover that can navigate the terrain and avoid obstacles. The objective of this step is to train the rover to reach different destinations. Thus, reusing the model saved from checkpoint three, we will fine-tune it to reach different destinations. We will do this by starting a new destination on every episode. This destination will have to be reachable by the rover, so while it will be randomized, we will check its reachability by using the A* algorithm while ignoring all probabilities and obstacles.
+
+**Agent information, movement, and failure:**
+
+- Agent information: current position, current inclination, surrounding inclination, surrounding rocks (with probability of being perceived).
+- Actions: Accelerate (continuous), decelerate (continuous), and full 360 degree turn.
+- Failure: The rover crashes if it tilts or runs into X number of rocks.
+
+## Proposed algorithms
+
+- SAC
+- TD3
+
+- If needed, policy network can be adjusted to a different architecture (but we propose to use it out of the box first).
