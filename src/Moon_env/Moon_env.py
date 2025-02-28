@@ -30,10 +30,14 @@ class LunarRover3DEnv(gym.Env):
                  render_mode="human", 
                  max_slope_deg=25, 
                  destination=None,
-                 smooth_sigma=None):
+                 smooth_sigma=None,
+                 desired_distance_m=100000,
+                 goal_radius_m=50):
         super().__init__()
         self.render_mode = render_mode
         self.max_slope_deg = max_slope_deg
+        self.goal_radius_m = goal_radius_m          # Store as instance variable
+        self.desired_distance_m = desired_distance_m
 
         # --- Load the DEM ---
         with rasterio.open(dem_path) as src:
@@ -105,8 +109,8 @@ class LunarRover3DEnv(gym.Env):
         print(f"Min elevation: {self.dem_min}, Max elevation: {self.dem_max}")
 
         # Spawn logic
-        center_x = (self.dem_shape[1] - 1) / 2.0
-        center_y = (self.dem_shape[0] - 1) * 0.68
+        center_x = (self.dem_shape[1] - 1) / 4.0
+        center_y = (self.dem_shape[0] - 1) * 0.60
         self.spawn = (center_x, center_y)
 
         # Destination
@@ -122,6 +126,9 @@ class LunarRover3DEnv(gym.Env):
 
         # PyVista plotter
         self.plotter = None
+        
+        print(f"DEM resolution: x={self.x_res} m/px, y={self.y_res} m/px")
+        print(f"Subregion size (meters): {self.dem_shape[0] * self.y_res / 1000} km x {self.dem_shape[1] * self.x_res / 1000} km")
 
     # -------------------------------------------------------------------------
     # Slope / Height Utilities
@@ -166,7 +173,7 @@ class LunarRover3DEnv(gym.Env):
         Compute the slope in degrees from (x1, y1) to (x2, y2) in pixel coords,
         using physical distances in meters. Returns signed slope (negative = downhill).
         """
-        # Convert pixel coords to meters
+        # Convert pixel coords to meters - consistent conversion
         x1_m = x1 * self.x_res
         y1_m = y1 * self.y_res
         x2_m = x2 * self.x_res
@@ -180,11 +187,12 @@ class LunarRover3DEnv(gym.Env):
         if horizontal_dist_m < 1e-9:
             return 0.0  # Avoid division by zero
 
+        # Get heights at these positions
         z1 = self.get_height(x1, y1)
         z2 = self.get_height(x2, y2)
         dz = z2 - z1  # Retain sign for downhill/uphill
 
-        slope_rad = math.atan(dz / horizontal_dist_m)  # No `abs(dz)`
+        slope_rad = math.atan(dz / horizontal_dist_m)
         slope_deg = math.degrees(slope_rad)
         return slope_deg  # Signed value
 
@@ -389,22 +397,22 @@ class LunarRover3DEnv(gym.Env):
         Attempt to find a destination that is reachable by A* within slope limit.
         Radial search for demonstration. 
         """
-        distances = [20000, 21000, 22000]  # in pixels
+        desired_distance_px_x = self.desired_distance_m / self.x_res  # Use hyperparameter
+        desired_distance_px_y = self.desired_distance_m / self.y_res  # Use hyperparameter
         angles = np.linspace(0, 360, 36)
 
-        for d in distances:
-            for angle_deg in angles:
-                rad = math.radians(angle_deg)
-                cx = spawn[0] + d * math.cos(rad)
-                cy = spawn[1] + d * math.sin(rad)
-                # clamp
-                cx = np.clip(cx, 0, self.dem_shape[1] - 1)
-                cy = np.clip(cy, 0, self.dem_shape[0] - 1)
-                candidate = (cx, cy)
+        for angle_deg in angles:
+            rad = math.radians(angle_deg)
+            cx = spawn[0] + desired_distance_px_x * math.cos(rad)
+            cy = spawn[1] + desired_distance_px_y * math.sin(rad)
+            # clamp
+            cx = np.clip(cx, 0, self.dem_shape[1] - 1)
+            cy = np.clip(cy, 0, self.dem_shape[0] - 1)
+            candidate = (cx, cy)
 
-                if self.check_path_possible(spawn, candidate):
-                    print("Selected reachable destination:", candidate)
-                    return candidate
+            if self.check_path_possible(spawn, candidate):
+                print("Selected reachable destination:", candidate)
+                return candidate
 
         # If none found, return the spawn as fallback or None
         return spawn
@@ -498,8 +506,11 @@ class LunarRover3DEnv(gym.Env):
 
         # Goal check
         gx, gy = self.goal
-        dist_to_goal = np.linalg.norm([new_x - gx, new_y - gy])
-        if dist_to_goal < 5.0:
+        dx_m = (new_x - gx) * self.x_res
+        dy_m = (new_y - gy) * self.y_res
+        dist_to_goal_m = np.linalg.norm([dx_m, dy_m])
+        if dist_to_goal_m < self.goal_radius_m:  # meters
+
             reward += 100.0
             done = True
         else:
@@ -552,12 +563,20 @@ class LunarRover3DEnv(gym.Env):
             self._add_astar_path_mesh(self.path_found)
 
         # Camera
-        offset = 200000
+        offset = 150000
         self.plotter.camera_position = [
             (x_m + offset, y_m + offset, z_m + offset),  # camera location
             (x_m, y_m, z_m),                             # look at rover
             (0, 0, 1)                                    # up vector
         ]
+
+        # self.plotter = pv.Plotter(window_size=(1024, 768))
+        #self.plotter.enable_terrain_style()  # Optional: Better visualization
+        self.plotter.show_grid(
+            xtitle="X (meters)",
+            ytitle="Y (meters)",
+            ztitle="Elevation (meters)",
+        )
 
         if save_frames:
             return self.plotter.screenshot()
@@ -592,7 +611,7 @@ class LunarRover3DEnv(gym.Env):
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
     dem_file_path = "/Users/jbm/Desktop/Moon_Rover_SouthPole/src/map/LDEM_80S_20MPP_ADJ.tiff"
-    subregion_window = (24000, 40000, 28000, 44000)
+    subregion_window = (0, 10000, 0, 10000)
     env = LunarRover3DEnv(dem_file_path, subregion_window)
 
     # Optionally run A* from spawn -> destination
