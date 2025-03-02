@@ -24,7 +24,7 @@ As mentioned, this algorithm proposes to automate the displacement of rovers on 
 
 ## Checkpoint 1: Path Planning (destination is always fixed)
 
-The first step in the development of this system will involve utilizing the terrain data with no additional information. Here, we will use this data to find the shortest and safest (meaning it has slopes of less than 25 degrees) path to the destination by leveraging the A* algorithm. At this point, we will train an RL algorithm to get to that destination and contrast the results with one another, looking at their main differences in pathfinding and time to reach the destination to make improvements.
+The first step in the development of this system will involve utilizing the terrain data with no additional information. Here, we will use this data to find the shortest and safest (meaning it has slopes of less than 25 degrees, lateral and frontwise) path to the destination by leveraging the A* algorithm. At this point, we will train an RL algorithm to get to that destination and contrast the results with one another, looking at their main differences in pathfinding and time to reach the destination to make improvements.
 
 **Agent information, movement, and failure:**
 
