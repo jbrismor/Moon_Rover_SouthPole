@@ -118,11 +118,15 @@ class LunarRover3DEnv(gym.Env):
             self.destination = self.compute_reachable_destination_from_spawn(self.spawn)
         else:
             self.destination = destination
+            # Compute path for predefined destination
+            start_rc = (int(round(self.spawn[1])), int(round(self.spawn[0])))
+            goal_rc = (int(round(self.destination[1])), int(round(self.destination[0])))
+            self.path_found = self.astar_path(start_rc, goal_rc)
 
         print(f"Spawn: {self.spawn}, Destination: {self.destination}")
 
         # For optional path rendering
-        self.path_found = None
+        # self.path_found = None
 
         # PyVista plotter
         self.plotter = None
@@ -195,6 +199,26 @@ class LunarRover3DEnv(gym.Env):
         slope_rad = math.atan(dz / horizontal_dist_m)
         slope_deg = math.degrees(slope_rad)
         return slope_deg  # Signed value
+    
+    def get_lateral_inclination(self, x, y, theta, side_px=1.0):
+        """
+        Returns the slope in the direction perpendicular to the rover’s heading.
+        side_px indicates how far to look 'sideways' from the current position.
+        """
+        # Perpendicular heading: theta + 90°
+        lateral_theta = theta + np.pi / 2.0
+        
+        # Destination pixel to the side
+        x2 = x + side_px * math.cos(lateral_theta)
+        y2 = y + side_px * math.sin(lateral_theta)
+        
+        # Clamp to DEM boundaries
+        x2 = np.clip(x2, 0, self.dem_shape[1] - 1)
+        y2 = np.clip(y2, 0, self.dem_shape[0] - 1)
+        
+        # Reuse the same slope calc
+        return self.get_slope(x, y, x2, y2)
+
 
     def get_current_inclination(self, x, y, theta, forward_px=1.0):
         """
@@ -325,26 +349,42 @@ class LunarRover3DEnv(gym.Env):
 
     #     return None  # No path found
 
+    def get_transition_lateral_slope(self, x1, y1, x2, y2, side_px=1.0):
+        """
+        In a grid-based A*, we have no explicit 'theta'. We treat the direction
+        from (x1,y1) to (x2,y2) as the heading, then check the slope 90° from
+        that heading at the new cell (x2,y2).
+        """
+        dx = x2 - x1
+        dy = y2 - y1
+        heading_theta = math.atan2(dy, dx)  # direction of travel
+        lateral_theta = heading_theta + np.pi / 2.0
+
+        # We'll measure the slope from the new cell outward to the side.
+        side_x = x2 + side_px * math.cos(lateral_theta)
+        side_y = y2 + side_px * math.sin(lateral_theta)
+
+        # clamp
+        side_x = np.clip(side_x, 0, self.dem_shape[1] - 1)
+        side_y = np.clip(side_y, 0, self.dem_shape[0] - 1)
+
+        return self.get_slope(x2, y2, side_x, side_y)
+
     def astar_path(self, start, goal):
         """
         A* over the 2D grid (row, col) = (y, x), with 8 neighbors.
-        The slope constraint is that it must be <= max_slope_deg in absolute value.
-        Measure slope in meters, as done in get_slope().
+        We now also check the lateral slope implied by the step from current->neighbor.
         """
         neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1),
-                     (-1, -1), (-1, 1), (1, -1), (1, 1)]
+                    (-1, -1), (-1, 1), (1, -1), (1, 1)]
 
         def distance(a, b):
             return np.linalg.norm(np.array(a) - np.array(b))
 
-        # Store them in open_set as (priority, cost, cell)
         open_set = []
         heappush(open_set, (distance(start, goal), 0.0, start))
         came_from = {}
         cost_so_far = {start: 0.0}
-
-        # Use the tangent threshold for slope check
-        tan_thresh = math.tan(math.radians(self.max_slope_deg))
 
         while open_set:
             _, current_cost, current = heappop(open_set)
@@ -365,11 +405,14 @@ class LunarRover3DEnv(gym.Env):
                 if ny < 0 or ny >= self.dem_shape[0] or nx < 0 or nx >= self.dem_shape[1]:
                     continue
 
-                # Check slope
-                # Convert (cy,cx)->(x,y) in pixel coords => (cx, cy)
-                # Inside the A* loop:
+                # Forward slope: from current cell (cx,cy) to neighbor (nx,ny)
                 slope_deg = self.get_slope(cx, cy, nx, ny)
-                if abs(slope_deg) > self.max_slope_deg:  # Enforce ±25° constraint
+
+                # Lateral slope: interpret orientation from (cx,cy)->(nx,ny)
+                side_slope_deg = self.get_transition_lateral_slope(cx, cy, nx, ny)
+
+                # If either slope is too steep, skip
+                if (abs(slope_deg) > self.max_slope_deg) or (abs(side_slope_deg) > self.max_slope_deg):
                     continue
 
                 new_cost = current_cost + distance(current, (ny, nx))
@@ -383,19 +426,18 @@ class LunarRover3DEnv(gym.Env):
 
     def check_path_possible(self, spawn, candidate_goal):
         """
-        Return True if A* path from spawn->candidate_goal is found.
-        spawn, candidate_goal are (x, y) in float pixel coords => we convert to int (y, x).
+        Return the A* path from spawn to candidate_goal if one exists,
+        otherwise return None.
         """
         start_rc = (int(round(spawn[1])), int(round(spawn[0])))
         goal_rc = (int(round(candidate_goal[1])), int(round(candidate_goal[0])))
-
-        path = self.astar_path(start_rc, goal_rc)
-        return path is not None
+        # Return the actual path (or None)
+        return self.astar_path(start_rc, goal_rc)
 
     def compute_reachable_destination_from_spawn(self, spawn):
         """
         Attempt to find a destination that is reachable by A* within slope limit.
-        Radial search for demonstration. 
+        The computed A* path is stored in self.path_found for later visualization.
         """
         desired_distance_px_x = self.desired_distance_m / self.x_res  # Use hyperparameter
         desired_distance_px_y = self.desired_distance_m / self.y_res  # Use hyperparameter
@@ -405,16 +447,19 @@ class LunarRover3DEnv(gym.Env):
             rad = math.radians(angle_deg)
             cx = spawn[0] + desired_distance_px_x * math.cos(rad)
             cy = spawn[1] + desired_distance_px_y * math.sin(rad)
-            # clamp
+            # Clamp to DEM boundaries
             cx = np.clip(cx, 0, self.dem_shape[1] - 1)
             cy = np.clip(cy, 0, self.dem_shape[0] - 1)
             candidate = (cx, cy)
 
-            if self.check_path_possible(spawn, candidate):
+            path = self.check_path_possible(spawn, candidate)
+            if path is not None:
                 print("Selected reachable destination:", candidate)
+                # Store the computed path for visualization
+                self.path_found = path
                 return candidate
 
-        # If none found, return the spawn as fallback or None
+        # If none found, return the spawn as fallback
         return spawn
 
     # -------------------------------------------------------------------------
@@ -494,9 +539,14 @@ class LunarRover3DEnv(gym.Env):
         # Observation
         obs = self.get_observation()
 
-        # Crash check if slope > 25° in the heading direction
-        current_incl = obs[4]  # the single "current_incl" in the vector
-        if abs(current_incl) > self.max_slope_deg:  # Check magnitude
+        # 1) Forward slope
+        current_incl = obs[4]
+
+        # 2) Lateral slope
+        lateral_incl = self.get_lateral_inclination(new_x, new_y, theta, side_px=1.0)
+
+        # Crash check if forward OR lateral slope exceed ±max_slope_deg
+        if abs(current_incl) > self.max_slope_deg or abs(lateral_incl) > self.max_slope_deg:
             reward = -50.0
             done = True
             return obs, reward, done, False, {}
@@ -509,8 +559,7 @@ class LunarRover3DEnv(gym.Env):
         dx_m = (new_x - gx) * self.x_res
         dy_m = (new_y - gy) * self.y_res
         dist_to_goal_m = np.linalg.norm([dx_m, dy_m])
-        if dist_to_goal_m < self.goal_radius_m:  # meters
-
+        if dist_to_goal_m < self.goal_radius_m:
             reward += 100.0
             done = True
         else:
@@ -614,10 +663,10 @@ if __name__ == "__main__":
     subregion_window = (0, 10000, 0, 10000)
     env = LunarRover3DEnv(dem_file_path, subregion_window)
 
-    # Optionally run A* from spawn -> destination
-    spawn_rc = (int(round(env.spawn[1])), int(round(env.spawn[0])))
-    goal_rc = (int(round(env.destination[1])), int(round(env.destination[0])))
-    env.path_found = env.astar_path(spawn_rc, goal_rc)
+    # # Optionally run A* from spawn -> destination
+    # spawn_rc = (int(round(env.spawn[1])), int(round(env.spawn[0])))
+    # goal_rc = (int(round(env.destination[1])), int(round(env.destination[0])))
+    # env.path_found = env.astar_path(spawn_rc, goal_rc)
 
     obs, _ = env.reset()
     env.render(show_path=True)
