@@ -7,7 +7,10 @@ import pyvista as pv
 from heapq import heappush, heappop
 import math
 from scipy.ndimage import gaussian_filter
+from scipy import ndimage
 import os
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 
 class LunarRover3DEnv(gym.Env):
     """
@@ -25,74 +28,74 @@ class LunarRover3DEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
 
     def __init__(self, 
-                 dem_path, 
-                 subregion_window=None, 
-                 render_mode="human", 
-                 max_slope_deg=25, 
-                 destination=None,
-                 smooth_sigma=None,
-                 desired_distance_m=100000,
-                 goal_radius_m=50):
+                dem_path, 
+                subregion_window=None, 
+                render_mode="human", 
+                max_slope_deg=25, 
+                destination=None,
+                smooth_sigma=None,
+                desired_distance_m=70000,
+                goal_radius_m=50):
         super().__init__()
         self.render_mode = render_mode
         self.max_slope_deg = max_slope_deg
-        self.goal_radius_m = goal_radius_m          # Store as instance variable
+        self.goal_radius_m = goal_radius_m
         self.desired_distance_m = desired_distance_m
+        self.path_found = None  # Make sure this is defined
 
         # --- Load the DEM ---
         with rasterio.open(dem_path) as src:
-            dem_data = src.read(1)
-            # Pixel resolution (meters per pixel)
-            self.x_res = abs(src.res[0])  # meters/pixel in x direction
-            self.y_res = abs(src.res[1])  # meters/pixel in y direction
-
+            # Get the resolution in meters
+            self.x_res = src.transform[0]  # meters/pixel in x direction
+            self.y_res = abs(src.transform[4])  # meters/pixel in y direction
             if subregion_window is not None:
                 row_start, row_end, col_start, col_end = subregion_window
-                self.dem = dem_data[row_start:row_end, col_start:col_end]
+                window = rasterio.windows.Window(
+                    col_start, row_start, 
+                    col_end - col_start, row_end - row_start
+                )
+                self.dem = src.read(1, window=window)
             else:
-                self.dem = dem_data
+                self.dem = src.read(1, masked=True)  # memory‐mapped
 
-        # Optional smoothing to remove small terrain noise:
+        # Optional smoothing:
         if smooth_sigma is not None:
             self.dem = gaussian_filter(self.dem, sigma=smooth_sigma)
 
-        self.dem_shape = self.dem.shape  # (rows, cols)
+        self.dem_shape = self.dem.shape
         self.dem_min = float(np.min(self.dem))
         self.dem_max = float(np.max(self.dem))
 
-        # Interpolator for continuous (x, y)->z (note: row=y, col=x)
+        # Interpolator for continuous (row=y, col=x)
         y_coords = np.arange(self.dem_shape[0])
         x_coords = np.arange(self.dem_shape[1])
         self.dem_interp = RegularGridInterpolator((y_coords, x_coords), self.dem)
 
-        # ---------------------------------------------------------------------
-        # Observation Space:
-        #   [ x, y, x_dest, y_dest, current_slope, surrounding_slopes(8) ]
-        # => dimension = 2 + 2 + 1 + 8 = 13
-        # x, y, x_dest, y_dest in [0, width-1], [0, height-1]
-        # slope values in [0, 90]
-        # ---------------------------------------------------------------------
-        obs_low = np.array([0.0, 
-                            0.0, 
-                            0.0, 
-                            0.0, 
-                            0.0] + [0.0]*8, dtype=np.float32)
-        obs_high = np.array([self.dem_shape[1]-1, 
-                             self.dem_shape[0]-1, 
-                             self.dem_shape[1]-1, 
-                             self.dem_shape[0]-1, 
-                             90.0] + [90.0]*8, dtype=np.float32)
+        # ---------- NEW CODE for gradients in “m/m” instead of “m/pixel” ----------
+        # 1) get the raw gradient in pixel units
+        raw_grad_x, raw_grad_y = np.gradient(self.dem)
+        # 2) convert them to "vertical meters per horizontal meter"
+        grad_x = raw_grad_x / self.y_res   # Because raw_grad_x was dZ/dRow, row→vertical pixel axis
+        grad_y = raw_grad_y / self.x_res   # Because raw_grad_y was dZ/dCol, col→horizontal pixel axis
+        self.grad_x = grad_x
+        self.grad_y = grad_y
+        # --------------------------------------------------------------------------
 
+        # Define the observation and action spaces
+        obs_low = np.array([0.0, 0.0, 0.0, 0.0, 0.0] + [0.0]*8, dtype=np.float32)
+        obs_high = np.array(
+            [self.dem_shape[1]-1, 
+            self.dem_shape[0]-1,
+            self.dem_shape[1]-1, 
+            self.dem_shape[0]-1,
+            90.0] + [90.0]*8, dtype=np.float32
+        )
         self.observation_space = spaces.Box(obs_low, obs_high, dtype=np.float32)
-
-        # Action Space: [turn (radians), forward_distance (pixels)]
-        #   turn in [-pi, pi], forward in [0, 1].
         self.action_space = spaces.Box(
             low=np.array([-np.pi, 0.0], dtype=np.float32),
             high=np.array([np.pi, 1.0], dtype=np.float32)
         )
 
-        # Internal state
         self.state = None  # [x, y, theta]
         self.max_steps = 1000
         self.current_step = 0
@@ -110,7 +113,7 @@ class LunarRover3DEnv(gym.Env):
 
         # Spawn logic
         center_x = (self.dem_shape[1] - 1) / 4.0
-        center_y = (self.dem_shape[0] - 1) * 0.60
+        center_y = (self.dem_shape[0] - 1) * 0.280
         self.spawn = (center_x, center_y)
 
         # Destination
@@ -118,32 +121,35 @@ class LunarRover3DEnv(gym.Env):
             self.destination = self.compute_reachable_destination_from_spawn(self.spawn)
         else:
             self.destination = destination
-            # Compute path for predefined destination
             start_rc = (int(round(self.spawn[1])), int(round(self.spawn[0])))
             goal_rc = (int(round(self.destination[1])), int(round(self.destination[0])))
             self.path_found = self.astar_path(start_rc, goal_rc)
 
         print(f"Spawn: {self.spawn}, Destination: {self.destination}")
-
-        # For optional path rendering
-        # self.path_found = None
-
-        # PyVista plotter
-        self.plotter = None
-        
         print(f"DEM resolution: x={self.x_res} m/px, y={self.y_res} m/px")
         print(f"Subregion size (meters): {self.dem_shape[0] * self.y_res / 1000} km x {self.dem_shape[1] * self.x_res / 1000} km")
+
+        self.plotter = None
 
     # -------------------------------------------------------------------------
     # Slope / Height Utilities
     # -------------------------------------------------------------------------
+    @lru_cache(maxsize=10000)
     def get_height(self, px, py):
-        """
-        Return the height at pixel coords (px, py).
-        Because the interpolator expects (row, col) = (y, x).
-        """
-        point = np.array([[py, px]], dtype=np.float32)
-        return float(self.dem_interp(point)[0])
+        """Faster bilinear interpolation with caching"""
+        # Convert to integer coordinates for caching
+        px, py = float(px), float(py)
+        
+        # Integer and fractional parts
+        x0, y0 = int(px), int(py)
+        x1, y1 = min(x0 + 1, self.dem_shape[1] - 1), min(y0 + 1, self.dem_shape[0] - 1)
+        dx, dy = px - x0, py - y0
+        
+        # Bilinear interpolation
+        return ((1-dx)*(1-dy)*self.dem[y0, x0] + 
+                dx*(1-dy)*self.dem[y0, x1] + 
+                (1-dx)*dy*self.dem[y1, x0] + 
+                dx*dy*self.dem[y1, x1])
 
     # def get_slope(self, x1, y1, x2, y2):
     #     """
@@ -172,37 +178,77 @@ class LunarRover3DEnv(gym.Env):
     #     slope_deg = math.degrees(slope_rad)
     #     return slope_deg
 
+    @lru_cache(maxsize=10000)
     def get_slope(self, x1, y1, x2, y2):
+        """Compute slope using precomputed gradients with caching"""
+        # Convert to float for consistent cache keys
+        x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
+        
+        # Use average gradient at the points
+        x_mid = (x1 + x2) / 2
+        y_mid = (y1 + y2) / 2
+        
+        # Get integer coordinates for sampling gradients
+        xi, yi = int(x_mid), int(y_mid)
+        xi = np.clip(xi, 0, self.dem_shape[1] - 2)
+        yi = np.clip(yi, 0, self.dem_shape[0] - 2)
+        
+        # Get direction vector in meters
+        dx_m = (x2 - x1) * self.x_res
+        dy_m = (y2 - y1) * self.y_res
+        dist_m = math.sqrt(dx_m**2 + dy_m**2)
+        
+        if dist_m < 1e-9:
+            return 0.0
+        
+        # Normalize direction vector
+        dx_norm = dx_m / dist_m
+        dy_norm = dy_m / dist_m
+        
+        # Dot product with gradient gives slope in that direction
+        slope = dx_norm * self.grad_x[yi, xi] + dy_norm * self.grad_y[yi, xi]
+        return math.degrees(math.atan(slope))
+    
+    def find_safe_spawn_point(self, initial_spawn_x, initial_spawn_y, search_radius=10):
         """
-        Compute the slope in degrees from (x1, y1) to (x2, y2) in pixel coords,
-        using physical distances in meters. Returns signed slope (negative = downhill).
+        Find a nearby safe spawn point if the initial one isn't suitable.
+        Searches in expanding circles around the initial point.
+        
+        Args:
+            initial_spawn_x, initial_spawn_y: Initial spawn coordinates
+            search_radius: How far to search for a safe point
+            
+        Returns:
+            (x, y) coordinates of a safe spawn point, or the initial point if none found
         """
-        # Convert pixel coords to meters - consistent conversion
-        x1_m = x1 * self.x_res
-        y1_m = y1 * self.y_res
-        x2_m = x2 * self.x_res
-        y2_m = y2 * self.y_res
-
-        # Horizontal distance
-        dx_m = x2_m - x1_m
-        dy_m = y2_m - y1_m
-        horizontal_dist_m = math.sqrt(dx_m**2 + dy_m**2)
-
-        if horizontal_dist_m < 1e-9:
-            return 0.0  # Avoid division by zero
-
-        # Get heights at these positions
-        z1 = self.get_height(x1, y1)
-        z2 = self.get_height(x2, y2)
-        dz = z2 - z1  # Retain sign for downhill/uphill
-
-        slope_rad = math.atan(dz / horizontal_dist_m)
-        slope_deg = math.degrees(slope_rad)
-        return slope_deg  # Signed value
+        # First check if the initial point is already safe
+        if self.check_all_directions_slopes(initial_spawn_x, initial_spawn_y):
+            return (initial_spawn_x, initial_spawn_y)
+        
+        # Search in expanding circles
+        for radius in range(1, search_radius + 1):
+            # Check points in a circle around the initial spawn
+            for angle in range(0, 360, 10):  # Check every 10 degrees
+                rad = math.radians(angle)
+                x = initial_spawn_x + radius * math.cos(rad)
+                y = initial_spawn_y + radius * math.sin(rad)
+                
+                # Ensure within DEM boundaries
+                x = np.clip(x, 0, self.dem_shape[1] - 1)
+                y = np.clip(y, 0, self.dem_shape[0] - 1)
+                
+                # Check if this point is safe
+                if self.check_all_directions_slopes(x, y):
+                    print(f"Found safe spawn at ({x}, {y}), {radius} pixels from initial spawn")
+                    return (x, y)
+        
+        # If no safe point found, return the initial point and log a warning
+        print(f"WARNING: Could not find safe spawn within {search_radius} pixels of initial spawn")
+        return (initial_spawn_x, initial_spawn_y)
     
     def get_lateral_inclination(self, x, y, theta, side_px=1.0):
         """
-        Returns the slope in the direction perpendicular to the rover’s heading.
+        Returns the slope in the direction perpendicular to the rover's heading.
         side_px indicates how far to look 'sideways' from the current position.
         """
         # Perpendicular heading: theta + 90°
@@ -271,17 +317,24 @@ class LunarRover3DEnv(gym.Env):
     # Observation
     # -------------------------------------------------------------------------
     def get_observation(self):
-        """
-        Builds the observation vector:
-           [ x, y, x_dest, y_dest, current_incl, surrounding_incl(8) ]
-        """
+        """More efficient observation building"""
         x, y, theta = self.state
         gx, gy = self.goal
-
-        # Slopes
-        current_incl = self.get_current_inclination(x, y, theta, forward_px=1.0)
+        
+        # Reuse the same forward vector for current_incl
+        forward_px = 1.0
+        dx = forward_px * math.cos(theta)
+        dy = forward_px * math.sin(theta)
+        x2 = np.clip(x + dx, 0, self.dem_shape[1] - 1)
+        y2 = np.clip(y + dy, 0, self.dem_shape[0] - 1)
+        
+        # Get current inclination
+        current_incl = self.get_slope(x, y, x2, y2)
+        
+        # Get surrounding inclinations
         surrounding_incl_list = self.get_surrounding_inclinations(x, y, dist_px=1.0)
-        # Flatten the 8 surrounding slopes
+        
+        # Combine into observation vector
         obs = np.array([
             x,
             y,
@@ -289,6 +342,7 @@ class LunarRover3DEnv(gym.Env):
             gy,
             current_incl
         ] + surrounding_incl_list, dtype=np.float32)
+        
         return obs
 
     # -------------------------------------------------------------------------
@@ -349,45 +403,132 @@ class LunarRover3DEnv(gym.Env):
 
     #     return None  # No path found
 
-    def get_transition_lateral_slope(self, x1, y1, x2, y2, side_px=1.0):
+    def check_all_directions_slopes(self, x, y, dist_px=1.0):
+        """Vectorized and optimized slope check in all directions"""
+        # Cache common values used in the function
+        x_res = self.x_res
+        max_slope_deg = self.max_slope_deg
+        
+        # Get center height once
+        center_height = self.get_height(x, y)
+        
+        # Only check 4 cardinal directions first (faster)
+        cardinal_dirs = [(0, dist_px), (dist_px, 0), (0, -dist_px), (-dist_px, 0)]
+        for dx, dy in cardinal_dirs:
+            x2 = np.clip(x + dx, 0, self.dem_shape[1] - 1)
+            y2 = np.clip(y + dy, 0, self.dem_shape[0] - 1)
+            
+            # Get height
+            height = self.get_height(x2, y2)
+            
+            # Calculate slope in meters
+            horizontal_dist_m = dist_px * x_res  # Assuming square pixels
+            slope_deg = math.degrees(math.atan(abs(height - center_height) / horizontal_dist_m))
+            
+            if slope_deg > max_slope_deg:
+                return False
+        
+        # Only check diagonals if cardinal directions pass
+        diagonal_dirs = [(dist_px, dist_px), (dist_px, -dist_px), 
+                        (-dist_px, dist_px), (-dist_px, -dist_px)]
+        
+        for dx, dy in diagonal_dirs:
+            x2 = np.clip(x + dx, 0, self.dem_shape[1] - 1)
+            y2 = np.clip(y + dy, 0, self.dem_shape[0] - 1)
+            
+            # Get height
+            height = self.get_height(x2, y2)
+            
+            # Calculate slope in meters (diagonal distance)
+            horizontal_dist_m = dist_px * x_res * math.sqrt(2)  # Diagonal distance
+            slope_deg = math.degrees(math.atan(abs(height - center_height) / horizontal_dist_m))
+            
+            if slope_deg > max_slope_deg:
+                return False
+        
+        return True
+
+    
+    def is_transition_safe(self, x1, y1, x2, y2, step_px=0.5):
         """
-        In a grid-based A*, we have no explicit 'theta'. We treat the direction
-        from (x1,y1) to (x2,y2) as the heading, then check the slope 90° from
-        that heading at the new cell (x2,y2).
+        Optimized version that checks if the path from (x1,y1) to (x2,y2) is safe
         """
         dx = x2 - x1
         dy = y2 - y1
-        heading_theta = math.atan2(dy, dx)  # direction of travel
-        lateral_theta = heading_theta + np.pi / 2.0
-
-        # We'll measure the slope from the new cell outward to the side.
-        side_x = x2 + side_px * math.cos(lateral_theta)
-        side_y = y2 + side_px * math.sin(lateral_theta)
-
-        # clamp
-        side_x = np.clip(side_x, 0, self.dem_shape[1] - 1)
-        side_y = np.clip(side_y, 0, self.dem_shape[0] - 1)
-
-        return self.get_slope(x2, y2, side_x, side_y)
+        distance = math.hypot(dx, dy)
+        
+        # Quick check: if distance is very small, just check endpoints
+        if distance < step_px:
+            return self.check_all_directions_slopes(x1, y1) and self.check_all_directions_slopes(x2, y2)
+        
+        steps = max(1, int(distance / step_px))
+        
+        # Check start and end first - most common failure points
+        if not (self.check_all_directions_slopes(x1, y1) and self.check_all_directions_slopes(x2, y2)):
+            return False
+        
+        # If only a few steps, check them all
+        if steps <= 3:
+            for i in range(1, steps):
+                t = i / steps
+                xi = x1 + t * dx
+                yi = y1 + t * dy
+                if not self.check_all_directions_slopes(xi, yi):
+                    return False
+            return True
+        
+        # For longer paths, check fewer intermediate points
+        # Check middle point and 1/4, 3/4 points
+        checkpoints = [0.25, 0.5, 0.75]
+        for t in checkpoints:
+            xi = x1 + t * dx
+            yi = y1 + t * dy
+            if not self.check_all_directions_slopes(xi, yi):
+                return False
+        
+        return True
 
     def astar_path(self, start, goal):
-        """
-        A* over the 2D grid (row, col) = (y, x), with 8 neighbors.
-        We now also check the lateral slope implied by the step from current->neighbor.
-        """
-        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1),
-                    (-1, -1), (-1, 1), (1, -1), (1, 1)]
-
-        def distance(a, b):
-            return np.linalg.norm(np.array(a) - np.array(b))
-
-        open_set = []
-        heappush(open_set, (distance(start, goal), 0.0, start))
+        """Highly optimized A* implementation"""
+        # Early exit if start == goal
+        if start == goal:
+            return [start]
+        
+        # Use a more efficient distance calculation
+        def octile_distance(a, b):
+            dx = abs(a[1] - b[1])
+            dy = abs(a[0] - b[0])
+            return max(dx, dy) + (math.sqrt(2) - 1) * min(dx, dy)
+        
+        # Create numpy array for visited nodes (much faster than dict lookups)
+        visited = np.zeros(self.dem_shape, dtype=bool)
+        # Create cost array initialized to infinity
+        cost_array = np.full(self.dem_shape, np.inf)
+        cost_array[start] = 0
+        
+        # Cardinal and diagonal movements with precalculated costs
+        neighbors = np.array([(-1, 0), (1, 0), (0, -1), (0, 1),
+                            (-1, -1), (-1, 1), (1, -1), (1, 1)])
+        costs = np.array([1.0, 1.0, 1.0, 1.0, math.sqrt(2), math.sqrt(2), math.sqrt(2), math.sqrt(2)])
+        
+        # Initialize priority queue with (f_score, tiebreaker, node_y, node_x)
+        open_set = [(octile_distance(start, goal), 0, start[0], start[1])]
+        # Dictionary for backtracking
         came_from = {}
-        cost_so_far = {start: 0.0}
-
+        counter = 0  # Tiebreaker for equal f-scores
+        
+        # Precompute goal coordinates for faster access
+        goal_y, goal_x = goal
+        
+        # For slope safety check optimization
+        max_slope_tan = math.tan(math.radians(self.max_slope_deg))
+        
         while open_set:
-            _, current_cost, current = heappop(open_set)
+            # Pop node with lowest f_score
+            _, _, cy, cx = heappop(open_set)
+            current = (cy, cx)
+            
+            # Goal check
             if current == goal:
                 # Reconstruct path
                 path = []
@@ -395,33 +536,65 @@ class LunarRover3DEnv(gym.Env):
                     path.append(current)
                     current = came_from[current]
                 path.append(start)
-                path.reverse()
-                return path
-
-            cy, cx = current
-            for dy, dx in neighbors:
+                return path[::-1]  # Faster than path.reverse()
+            
+            # Mark as visited
+            visited[cy, cx] = True
+            current_cost = cost_array[cy, cx]
+            
+            # Check all neighbors at once
+            for i, (dy, dx) in enumerate(neighbors):
                 ny, nx = cy + dy, cx + dx
-                # boundary check
-                if ny < 0 or ny >= self.dem_shape[0] or nx < 0 or nx >= self.dem_shape[1]:
+                
+                # Skip if out of bounds or already visited
+                if (ny < 0 or ny >= self.dem_shape[0] or 
+                    nx < 0 or nx >= self.dem_shape[1] or 
+                    visited[ny, nx]):
                     continue
-
-                # Forward slope: from current cell (cx,cy) to neighbor (nx,ny)
-                slope_deg = self.get_slope(cx, cy, nx, ny)
-
-                # Lateral slope: interpret orientation from (cx,cy)->(nx,ny)
-                side_slope_deg = self.get_transition_lateral_slope(cx, cy, nx, ny)
-
-                # If either slope is too steep, skip
-                if (abs(slope_deg) > self.max_slope_deg) or (abs(side_slope_deg) > self.max_slope_deg):
+                
+                # Quick slope check using precomputed gradients
+                # This avoids calling the expensive is_transition_safe for all neighbors
+                x_mid = (cx + nx) / 2
+                y_mid = (cy + ny) / 2
+                xi, yi = int(x_mid), int(y_mid)
+                xi = min(max(xi, 0), self.dem_shape[1] - 2)
+                yi = min(max(yi, 0), self.dem_shape[0] - 2)
+                
+                # Direction vector in pixels
+                dx_px = nx - cx
+                dy_px = ny - cy
+                dist_px = math.sqrt(dx_px**2 + dy_px**2)
+                
+                # Convert to meters
+                dx_m = dx_px * self.x_res
+                dy_m = dy_px * self.y_res
+                dist_m = math.sqrt(dx_m**2 + dy_m**2)
+                
+                # Normalize
+                dx_norm = dx_m / dist_m if dist_m > 1e-9 else 0
+                dy_norm = dy_m / dist_m if dist_m > 1e-9 else 0
+                
+                # Quick slope check
+                slope = dx_norm * self.grad_x[yi, xi] + dy_norm * self.grad_y[yi, xi]
+                if abs(slope) > max_slope_tan:
                     continue
-
-                new_cost = current_cost + distance(current, (ny, nx))
-                if (ny, nx) not in cost_so_far or new_cost < cost_so_far[(ny, nx)]:
-                    cost_so_far[(ny, nx)] = new_cost
-                    priority = new_cost + distance((ny, nx), goal)
-                    heappush(open_set, (priority, new_cost, (ny, nx)))
+                
+                # Only perform expensive check if quick check passes
+                if not self.is_transition_safe(cx, cy, nx, ny):
+                    continue
+                
+                # Calculate new cost
+                new_cost = current_cost + costs[i]
+                
+                # If better path found
+                if new_cost < cost_array[ny, nx]:
+                    # Update tracking information
                     came_from[(ny, nx)] = current
-
+                    cost_array[ny, nx] = new_cost
+                    f_score = new_cost + octile_distance((ny, nx), goal)
+                    counter += 1
+                    heappush(open_set, (f_score, counter, ny, nx))
+        
         return None  # No path found
 
     def check_path_possible(self, spawn, candidate_goal):
@@ -435,32 +608,80 @@ class LunarRover3DEnv(gym.Env):
         return self.astar_path(start_rc, goal_rc)
 
     def compute_reachable_destination_from_spawn(self, spawn):
-        """
-        Attempt to find a destination that is reachable by A* within slope limit.
-        The computed A* path is stored in self.path_found for later visualization.
-        """
-        desired_distance_px_x = self.desired_distance_m / self.x_res  # Use hyperparameter
-        desired_distance_px_y = self.desired_distance_m / self.y_res  # Use hyperparameter
-        angles = np.linspace(0, 360, 36)
-
+        """More efficient reachable destination computation"""
+        desired_distance_px_x = self.desired_distance_m / self.x_res
+        desired_distance_px_y = self.desired_distance_m / self.y_res
+        
+        # Try fewer angles first
+        angles = np.linspace(0, 360, 12, endpoint=False)  # 30-degree intervals
+        
         for angle_deg in angles:
             rad = math.radians(angle_deg)
             cx = spawn[0] + desired_distance_px_x * math.cos(rad)
             cy = spawn[1] + desired_distance_px_y * math.sin(rad)
-            # Clamp to DEM boundaries
             cx = np.clip(cx, 0, self.dem_shape[1] - 1)
             cy = np.clip(cy, 0, self.dem_shape[0] - 1)
             candidate = (cx, cy)
-
+            
+            # Check if slope is safe at destination
+            if not self.check_all_directions_slopes(cx, cy):
+                continue
+                
             path = self.check_path_possible(spawn, candidate)
             if path is not None:
-                print("Selected reachable destination:", candidate)
-                # Store the computed path for visualization
                 self.path_found = path
                 return candidate
-
-        # If none found, return the spawn as fallback
-        return spawn
+        
+        # If no path found with 30-degree intervals, try more angles
+        angles = np.linspace(0, 360, 36, endpoint=False)  # 10-degree intervals
+        
+        def check_angle(angle_deg):
+            rad = math.radians(angle_deg)
+            cx = spawn[0] + desired_distance_px_x * math.cos(rad)
+            cy = spawn[1] + desired_distance_px_y * math.sin(rad)
+            cx = np.clip(cx, 0, self.dem_shape[1] - 1)
+            cy = np.clip(cy, 0, self.dem_shape[0] - 1)
+            candidate = (cx, cy)
+            
+            # Check if slope is safe at destination
+            if not self.check_all_directions_slopes(cx, cy):
+                return None
+                
+            path = self.check_path_possible(spawn, candidate)
+            return (candidate, path) if path is not None else None
+        
+        # Check angles in parallel
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(check_angle, angles))
+        
+        # Filter out None results
+        valid_results = [r for r in results if r is not None]
+        
+        if valid_results:
+            # Get first valid result
+            candidate, path = valid_results[0]
+            self.path_found = path
+            return candidate
+        
+        # If no path found, try closer destinations
+        for distance_factor in [0.75, 0.5, 0.25]:
+            shorter_distance_px_x = desired_distance_px_x * distance_factor
+            shorter_distance_px_y = desired_distance_px_y * distance_factor
+            
+            for angle_deg in angles:
+                rad = math.radians(angle_deg)
+                cx = spawn[0] + shorter_distance_px_x * math.cos(rad)
+                cy = spawn[1] + shorter_distance_px_y * math.sin(rad)
+                cx = np.clip(cx, 0, self.dem_shape[1] - 1)
+                cy = np.clip(cy, 0, self.dem_shape[0] - 1)
+                candidate = (cx, cy)
+                
+                path = self.check_path_possible(spawn, candidate)
+                if path is not None:
+                    self.path_found = path
+                    return candidate
+        
+        return spawn  # Fallback to spawn if no path found
 
     # -------------------------------------------------------------------------
     # Gym Interface
@@ -469,9 +690,24 @@ class LunarRover3DEnv(gym.Env):
         super().reset(seed=seed)
         self.current_step = 0
 
+        # Get the initial spawn coordinates
+        initial_x, initial_y = self.spawn
+        
+        # Verify the spawn point is safe, find an alternative if not
+        safe_x, safe_y = self.find_safe_spawn_point(initial_x, initial_y)
+        
+        # Update the spawn point if it changed
+        if (safe_x, safe_y) != (initial_x, initial_y):
+            self.spawn = (safe_x, safe_y)
+            
+            # Optionally recalculate the destination if spawn changed significantly
+            spawn_changed_significantly = np.linalg.norm(np.array([safe_x - initial_x, safe_y - initial_y])) > 5
+            if spawn_changed_significantly and self.destination is not None:
+                print("Spawn changed significantly, recalculating destination")
+                self.destination = self.compute_reachable_destination_from_spawn(self.spawn)
+        
         # State = [x, y, theta]
-        start_x, start_y = self.spawn
-        self.state = np.array([start_x, start_y, 0.0], dtype=np.float32)
+        self.state = np.array([safe_x, safe_y, 0.0], dtype=np.float32)
 
         self.goal = self.destination
 
@@ -522,50 +758,61 @@ class LunarRover3DEnv(gym.Env):
     def step(self, action):
         x, y, theta = self.state
         turn, forward = action
-
-        # Update heading
         theta += turn
 
-        # Move forward (in pixel coords)
-        new_x = x + forward * math.cos(theta)
-        new_y = y + forward * math.sin(theta)
-        # clamp
-        new_x = np.clip(new_x, 0, self.dem_shape[1] - 1)
-        new_y = np.clip(new_y, 0, self.dem_shape[0] - 1)
+        # Skip interpolation for small movements
+        if forward <= 0.1:
+            new_x = x + forward * math.cos(theta)
+            new_y = y + forward * math.sin(theta)
+            new_x = np.clip(new_x, 0, self.dem_shape[1] - 1)
+            new_y = np.clip(new_y, 0, self.dem_shape[0] - 1)
+            
+            # Check slopes at the destination point
+            if not self.check_all_directions_slopes(new_x, new_y):
+                self.state = np.array([new_x, new_y, theta], dtype=np.float32)
+                return self.get_observation(), -50.0, True, False, {}
+                
+            self.state = np.array([new_x, new_y, theta], dtype=np.float32)
+        else:
+            # Interpolate movement into smaller steps for longer movements
+            step_size = 0.2  # Larger step size than before (0.1)
+            steps = max(int(forward / step_size), 1)
+            
+            for i in range(steps):
+                partial_forward = (i + 1) * step_size
+                new_x = x + min(partial_forward, forward) * math.cos(theta)
+                new_y = y + min(partial_forward, forward) * math.sin(theta)
+                new_x = np.clip(new_x, 0, self.dem_shape[1] - 1)
+                new_y = np.clip(new_y, 0, self.dem_shape[0] - 1)
+                
+                # Check slopes
+                if not self.check_all_directions_slopes(new_x, new_y):
+                    self.state = np.array([new_x, new_y, theta], dtype=np.float32)
+                    return self.get_observation(), -50.0, True, False, {}
+                    
+                # Update position for next step
+                x, y = new_x, new_y
+                
+            # Update final state
+            self.state = np.array([x, y, theta], dtype=np.float32)
 
-        self.state = np.array([new_x, new_y, theta], dtype=np.float32)
-        self.current_step += 1
-
-        # Observation
-        obs = self.get_observation()
-
-        # 1) Forward slope
-        current_incl = obs[4]
-
-        # 2) Lateral slope
-        lateral_incl = self.get_lateral_inclination(new_x, new_y, theta, side_px=1.0)
-
-        # Crash check if forward OR lateral slope exceed ±max_slope_deg
-        if abs(current_incl) > self.max_slope_deg or abs(lateral_incl) > self.max_slope_deg:
-            reward = -50.0
-            done = True
-            return obs, reward, done, False, {}
-
-        # Basic shaping reward
+        # Reward calculation
         reward = -0.1
-
-        # Goal check
+        
+        # Check goal
         gx, gy = self.goal
-        dx_m = (new_x - gx) * self.x_res
-        dy_m = (new_y - gy) * self.y_res
+        dx_m = (x - gx) * self.x_res
+        dy_m = (y - gy) * self.y_res
         dist_to_goal_m = np.linalg.norm([dx_m, dy_m])
+        
         if dist_to_goal_m < self.goal_radius_m:
             reward += 100.0
             done = True
         else:
+            self.current_step += 1
             done = (self.current_step >= self.max_steps)
 
-        return obs, reward, done, False, {}
+        return self.get_observation(), reward, done, False, {}
 
     # -------------------------------------------------------------------------
     # Rendering
@@ -660,7 +907,7 @@ class LunarRover3DEnv(gym.Env):
 # -------------------------------------------------------------------------
 if __name__ == "__main__":
     dem_file_path = "/Users/jbm/Desktop/Moon_Rover_SouthPole/src/map/LDEM_80S_20MPP_ADJ.tiff"
-    subregion_window = (0, 10000, 0, 10000)
+    subregion_window = (0, 6000, 0, 6000)
     env = LunarRover3DEnv(dem_file_path, subregion_window)
 
     # # Optionally run A* from spawn -> destination
