@@ -349,32 +349,41 @@ class LunarRover3DEnv(gym.Env):
 
     #     return None  # No path found
 
-    def get_transition_lateral_slope(self, x1, y1, x2, y2, side_px=1.0):
+    def check_all_directions_slopes(self, x, y, dist_px=1.0):
         """
-        In a grid-based A*, we have no explicit 'theta'. We treat the direction
-        from (x1,y1) to (x2,y2) as the heading, then check the slope 90° from
-        that heading at the new cell (x2,y2).
+        Checks slopes in all 8 directions around (x, y). 
+        Returns True if *all* 8 directions are within ±max_slope_deg, else False.
+        """
+        slopes = self.get_surrounding_inclinations(x, y, dist_px)
+        for s in slopes:
+            if abs(s) > self.max_slope_deg:
+                return False
+        return True
+
+    
+    def is_transition_safe(self, x1, y1, x2, y2, step_px=0.5):
+        """
+        Checks if the path from (x1,y1) to (x2,y2) is safe in *all* directions,
+        by interpolating points between them and calling check_all_directions_slopes().
         """
         dx = x2 - x1
         dy = y2 - y1
-        heading_theta = math.atan2(dy, dx)  # direction of travel
-        lateral_theta = heading_theta + np.pi / 2.0
+        distance = math.hypot(dx, dy)
+        steps = max(1, int(distance / step_px))  # Ensure at least 1 step
 
-        # We'll measure the slope from the new cell outward to the side.
-        side_x = x2 + side_px * math.cos(lateral_theta)
-        side_y = y2 + side_px * math.sin(lateral_theta)
+        for i in range(steps + 1):
+            # Interpolate between start and end
+            t = i / steps
+            xi = x1 + t * dx
+            yi = y1 + t * dy
 
-        # clamp
-        side_x = np.clip(side_x, 0, self.dem_shape[1] - 1)
-        side_y = np.clip(side_y, 0, self.dem_shape[0] - 1)
+            # If any of the 8 directions from (xi, yi) is beyond max_slope_deg, fail
+            if not self.check_all_directions_slopes(xi, yi, dist_px=1.0):
+                return False
 
-        return self.get_slope(x2, y2, side_x, side_y)
+        return True
 
     def astar_path(self, start, goal):
-        """
-        A* over the 2D grid (row, col) = (y, x), with 8 neighbors.
-        We now also check the lateral slope implied by the step from current->neighbor.
-        """
         neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1),
                     (-1, -1), (-1, 1), (1, -1), (1, 1)]
 
@@ -401,19 +410,13 @@ class LunarRover3DEnv(gym.Env):
             cy, cx = current
             for dy, dx in neighbors:
                 ny, nx = cy + dy, cx + dx
-                # boundary check
+                # Boundary check
                 if ny < 0 or ny >= self.dem_shape[0] or nx < 0 or nx >= self.dem_shape[1]:
                     continue
 
-                # Forward slope: from current cell (cx,cy) to neighbor (nx,ny)
-                slope_deg = self.get_slope(cx, cy, nx, ny)
-
-                # Lateral slope: interpret orientation from (cx,cy)->(nx,ny)
-                side_slope_deg = self.get_transition_lateral_slope(cx, cy, nx, ny)
-
-                # If either slope is too steep, skip
-                if (abs(slope_deg) > self.max_slope_deg) or (abs(side_slope_deg) > self.max_slope_deg):
-                    continue
+                # --- Remove redundant slope checks below ---
+                if not self.is_transition_safe(cx, cy, nx, ny):
+                    continue  # Skip unsafe transitions
 
                 new_cost = current_cost + distance(current, (ny, nx))
                 if (ny, nx) not in cost_so_far or new_cost < cost_so_far[(ny, nx)]:
@@ -522,50 +525,55 @@ class LunarRover3DEnv(gym.Env):
     def step(self, action):
         x, y, theta = self.state
         turn, forward = action
-
-        # Update heading
         theta += turn
 
-        # Move forward (in pixel coords)
-        new_x = x + forward * math.cos(theta)
-        new_y = y + forward * math.sin(theta)
-        # clamp
-        new_x = np.clip(new_x, 0, self.dem_shape[1] - 1)
-        new_y = np.clip(new_y, 0, self.dem_shape[0] - 1)
+        # Interpolate movement into smaller steps
+        step_size = 0.1  # Pixels per interpolation step
+        steps = max(int(forward / step_size), 1)
 
-        self.state = np.array([new_x, new_y, theta], dtype=np.float32)
-        self.current_step += 1
+        crashed = False
+        for i in range(steps):
+            partial_forward = (i + 1) * step_size
+            new_x = x + partial_forward * math.cos(theta)
+            new_y = y + partial_forward * math.sin(theta)
+            new_x = np.clip(new_x, 0, self.dem_shape[1] - 1)
+            new_y = np.clip(new_y, 0, self.dem_shape[0] - 1)
 
-        # Observation
-        obs = self.get_observation()
+            # Check slopes in ALL directions around (new_x, new_y)
+            if not self.check_all_directions_slopes(new_x, new_y, dist_px=1.0):
+                crashed = True
+                # Update state *at the crash point* if you like
+                x, y = new_x, new_y
+                break
 
-        # 1) Forward slope
-        current_incl = obs[4]
+            # Otherwise accept the partial step
+            x, y = new_x, new_y
 
-        # 2) Lateral slope
-        lateral_incl = self.get_lateral_inclination(new_x, new_y, theta, side_px=1.0)
+        # Update final position after this step
+        self.state = np.array([x, y, theta], dtype=np.float32)
 
-        # Crash check if forward OR lateral slope exceed ±max_slope_deg
-        if abs(current_incl) > self.max_slope_deg or abs(lateral_incl) > self.max_slope_deg:
+        if crashed:
             reward = -50.0
             done = True
-            return obs, reward, done, False, {}
+            return self.get_observation(), reward, done, False, {}
 
         # Basic shaping reward
         reward = -0.1
-
-        # Goal check
+        
+        # Check goal
         gx, gy = self.goal
-        dx_m = (new_x - gx) * self.x_res
-        dy_m = (new_y - gy) * self.y_res
+        dx_m = (x - gx) * self.x_res
+        dy_m = (y - gy) * self.y_res
         dist_to_goal_m = np.linalg.norm([dx_m, dy_m])
         if dist_to_goal_m < self.goal_radius_m:
             reward += 100.0
             done = True
         else:
+            self.current_step += 1
             done = (self.current_step >= self.max_steps)
 
-        return obs, reward, done, False, {}
+        return self.get_observation(), reward, done, False, {}
+
 
     # -------------------------------------------------------------------------
     # Rendering
