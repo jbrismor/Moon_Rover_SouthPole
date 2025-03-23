@@ -77,22 +77,19 @@ class LunarRover3DEnv(gym.Env):
         self.dem_shape[1] * self.x_res,
         self.dem_shape[0] * self.y_res)
 
-        # Initialize cold regions
-        self._init_cold_regions()
-
         # Interpolator for continuous (row=y, col=x)
         y_coords = np.arange(self.dem_shape[0])
         x_coords = np.arange(self.dem_shape[1])
         self.dem_interp = RegularGridInterpolator((y_coords, x_coords), self.dem)
 
         # ---------- NEW CODE for gradients in “m/m” instead of “m/pixel” ----------
-        # 1) get the raw gradient in pixel units
+        # 1) get the raw gradient in pixel units and then to meters
         raw_grad_x, raw_grad_y = np.gradient(self.dem)
-        # 2) convert them to "vertical meters per horizontal meter"
-        grad_x = raw_grad_x / self.y_res   # Because raw_grad_x was dZ/dRow, row→vertical pixel axis
-        grad_y = raw_grad_y / self.x_res   # Because raw_grad_y was dZ/dCol, col→horizontal pixel axis
+        grad_x = raw_grad_x / self.x_res  
+        grad_y = raw_grad_y / self.y_res
         self.grad_x = grad_x
         self.grad_y = grad_y
+
         # --------------------------------------------------------------------------
 
         # Define the observation and action spaces
@@ -123,7 +120,6 @@ class LunarRover3DEnv(gym.Env):
         self.state = None  # [x, y, theta]
         self.max_steps = 10000
         self.current_step = 0
-        self._initialize_environment(destination)
 
         # Precompute grid in meters for rendering
         X, Y = np.meshgrid(
@@ -132,6 +128,14 @@ class LunarRover3DEnv(gym.Env):
         )
         self.X = X.astype(np.float32)
         self.Y = Y.astype(np.float32)
+
+        # Initialize cold regions
+        self._init_cold_regions()
+
+        # Precompute safety map
+        self.max_slope_tan = math.tan(math.radians(self.max_slope_deg))
+        self._precompute_safety_map() 
+        self._initialize_environment(destination)
 
         print(f"DEM size: {self.dem.shape}")
         print(f"Min elevation: {self.dem_min}, Max elevation: {self.dem_max}")
@@ -155,6 +159,14 @@ class LunarRover3DEnv(gym.Env):
         print(f"Subregion size (meters): {self.dem_shape[0] * self.y_res / 1000} km x {self.dem_shape[1] * self.x_res / 1000} km")
 
         self.plotter = None
+
+    def _precompute_safety_map(self):
+        """Precompute safety map for rapid slope checks"""
+        # Calculate gradient magnitude
+        grad_magnitude = np.sqrt(self.grad_x**2 + self.grad_y**2)
+        # Create safety map (True = safe)
+        self.safety_map = (np.abs(grad_magnitude) <= self.max_slope_tan)
+        self.safety_map &= ~self.cold_region_mask
 
     def _init_cold_regions(self):
         """Properly initialized cold regions"""
@@ -186,53 +198,32 @@ class LunarRover3DEnv(gym.Env):
     # -------------------------------------------------------------------------
     # Slope / Height Utilities
     # -------------------------------------------------------------------------
-    @lru_cache(maxsize=10000)
-    def get_height(self, px, py):
-        """Faster bilinear interpolation with caching"""
-        # Convert to integer coordinates for caching
-        px, py = float(px), float(py)
-        
-        # Integer and fractional parts
-        x0, y0 = int(px), int(py)
-        x1, y1 = min(x0 + 1, self.dem_shape[1] - 1), min(y0 + 1, self.dem_shape[0] - 1)
-        dx, dy = px - x0, py - y0
-        
-        # Bilinear interpolation
-        return ((1-dx)*(1-dy)*self.dem[y0, x0] + 
-                dx*(1-dy)*self.dem[y0, x1] + 
-                (1-dx)*dy*self.dem[y1, x0] + 
-                dx*dy*self.dem[y1, x1])
 
-    @lru_cache(maxsize=10000)
-    def get_slope(self, x1, y1, x2, y2):
-        """Compute slope using precomputed gradients with caching"""
-        # Convert to float for consistent cache keys
-        x1, y1, x2, y2 = float(x1), float(y1), float(x2), float(y2)
+    def get_height(self, px, py):
+        """Fast height lookup using interpolator"""
+        return self.dem_interp((py, px))
+
+    def get_slope(self, x, y, theta):
+        """Calculate slope in heading direction using precomputed gradients"""
+        xi = int(np.clip(x, 0, self.dem_shape[1]-1))
+        yi = int(np.clip(y, 0, self.dem_shape[0]-1))
         
-        # Use average gradient at the points
-        x_mid = (x1 + x2) / 2
-        y_mid = (y1 + y2) / 2
+        # Get direction vector components (unit vector)
+        dx = math.cos(theta)
+        dy = math.sin(theta)
+        dist = math.hypot(dx, dy)
         
-        # Get integer coordinates for sampling gradients
-        xi, yi = int(x_mid), int(y_mid)
-        xi = np.clip(xi, 0, self.dem_shape[1] - 2)
-        yi = np.clip(yi, 0, self.dem_shape[0] - 2)
-        
-        # Get direction vector in meters
-        dx_m = (x2 - x1) * self.x_res
-        dy_m = (y2 - y1) * self.y_res
-        dist_m = math.sqrt(dx_m**2 + dy_m**2)
-        
-        if dist_m < 1e-9:
+        if dist < 1e-9:
             return 0.0
         
-        # Normalize direction vector
-        dx_norm = dx_m / dist_m
-        dy_norm = dy_m / dist_m
+        # Normalize direction vector (though already unit length)
+        dx /= dist
+        dy /= dist
         
-        # Dot product with gradient gives slope in that direction
-        slope = dx_norm * self.grad_x[yi, xi] + dy_norm * self.grad_y[yi, xi]
+        # Dot product with gradient gives slope
+        slope = dx * self.grad_x[yi, xi] + dy * self.grad_y[yi, xi]
         return math.degrees(math.atan(slope))
+
     
     def find_safe_spawn_point(self, initial_spawn_x, initial_spawn_y, search_radius=10):
         """
@@ -272,54 +263,30 @@ class LunarRover3DEnv(gym.Env):
         print(f"WARNING: Could not find safe spawn within {search_radius} pixels of initial spawn")
         return (initial_spawn_x, initial_spawn_y)
     
-    def get_lateral_inclination(self, x, y, theta, side_px=1.0):
-        """
-        Returns the slope in the direction perpendicular to the rover's heading.
-        side_px indicates how far to look 'sideways' from the current position.
-        """
-        # Perpendicular heading: theta + 90°
-        lateral_theta = theta + np.pi / 2.0
-        
-        # Destination pixel to the side
-        x2 = x + side_px * math.cos(lateral_theta)
-        y2 = y + side_px * math.sin(lateral_theta)
-        
-        # Clamp to DEM boundaries
-        x2 = np.clip(x2, 0, self.dem_shape[1] - 1)
-        y2 = np.clip(y2, 0, self.dem_shape[0] - 1)
-        
-        # Reuse the same slope calc
-        return self.get_slope(x, y, x2, y2)
-
-
     def get_current_inclination(self, x, y, theta, forward_px=1.0):
-        """
-        Slope in degrees in the rover's heading direction.
-        We'll check a small distance 'forward_px' in front.
-        """
-        x2 = x + forward_px * math.cos(theta)
-        y2 = y + forward_px * math.sin(theta)
-        # clamp to DEM boundaries
-        x2 = np.clip(x2, 0, self.dem_shape[1] - 1)
-        y2 = np.clip(y2, 0, self.dem_shape[0] - 1)
-        return self.get_slope(x, y, x2, y2)
+        """Slope in degrees in the rover's heading direction"""
+        # Simply use the heading direction for slope calculation
+        return self.get_slope(x, y, theta)
 
-    def get_surrounding_inclinations(self, x, y, dist_px=1.0):
-        """
-        Return slopes in 8 directions (signed degrees).
-        Example: -15° = downhill, +15° = uphill.
-        """
-        directions_deg = [0, 45, 90, 135, 180, 225, 270, 315]
-        slopes = []
-        for d in directions_deg:
-            theta = math.radians(d)
-            x2 = x + dist_px * math.cos(theta)
-            y2 = y + dist_px * math.sin(theta)
-            x2 = np.clip(x2, 0, self.dem_shape[1] - 1)
-            y2 = np.clip(y2, 0, self.dem_shape[0] - 1)
-            slope = self.get_slope(x, y, x2, y2)  # Signed slope
-            slopes.append(slope)
-        return slopes
+    def get_surrounding_inclinations(self, x, y):
+        """Vectorized surrounding slope calculation"""
+        xi = int(np.clip(x, 0, self.dem_shape[1]-1))
+        yi = int(np.clip(y, 0, self.dem_shape[0]-1))
+        
+        # Precomputed directions in meters
+        directions = np.array([
+            (1, 0), (1, 1), (0, 1), (-1, 1),
+            (-1, 0), (-1, -1), (0, -1), (1, -1)
+        ]) * np.array([self.x_res, self.y_res])
+        
+        # Normalize directions
+        norms = np.linalg.norm(directions, axis=1)
+        directions_normalized = directions / norms[:, np.newaxis]
+        
+        # Calculate slopes
+        slopes = (directions_normalized[:, 0] * self.grad_x[yi, xi] + 
+                directions_normalized[:, 1] * self.grad_y[yi, xi])
+        return np.degrees(np.arctan(slopes)).tolist()
 
     # -------------------------------------------------------------------------
     # Observation
@@ -371,264 +338,161 @@ class LunarRover3DEnv(gym.Env):
                 
         return min_dist, min_angle
 
-    def check_all_directions_slopes(self, x, y, dist_px=1.0):
-        """Vectorized and optimized slope check in all directions"""
-        # Cache common values used in the function
-        x_res = self.x_res
-        max_slope_deg = self.max_slope_deg
-        
-        # Get center height once
-        center_height = self.get_height(x, y)
-        
-        # Only check 4 cardinal directions first (faster)
-        cardinal_dirs = [(0, dist_px), (dist_px, 0), (0, -dist_px), (-dist_px, 0)]
-        for dx, dy in cardinal_dirs:
-            x2 = np.clip(x + dx, 0, self.dem_shape[1] - 1)
-            y2 = np.clip(y + dy, 0, self.dem_shape[0] - 1)
-            
-            # Get height
-            height = self.get_height(x2, y2)
-            
-            # Calculate slope in meters
-            horizontal_dist_m = dist_px * x_res  # Assuming square pixels
-            slope_deg = math.degrees(math.atan(abs(height - center_height) / horizontal_dist_m))
-            
-            if slope_deg > max_slope_deg:
-                return False
-        
-        # Only check diagonals if cardinal directions pass
-        diagonal_dirs = [(dist_px, dist_px), (dist_px, -dist_px), 
-                        (-dist_px, dist_px), (-dist_px, -dist_px)]
-        
-        for dx, dy in diagonal_dirs:
-            x2 = np.clip(x + dx, 0, self.dem_shape[1] - 1)
-            y2 = np.clip(y + dy, 0, self.dem_shape[0] - 1)
-            
-            # Get height
-            height = self.get_height(x2, y2)
-            
-            # Calculate slope in meters (diagonal distance)
-            horizontal_dist_m = dist_px * x_res * math.sqrt(2)  # Diagonal distance
-            slope_deg = math.degrees(math.atan(abs(height - center_height) / horizontal_dist_m))
-            
-            if slope_deg > max_slope_deg:
-                return False
-        
-        return True
-
+    def check_all_directions_slopes(self, x, y):
+        """Ultra-fast slope safety check using precomputed safety map"""
+        xi = int(np.clip(x, 0, self.dem_shape[1]-1))
+        yi = int(np.clip(y, 0, self.dem_shape[0]-1))
+        return self.safety_map[yi, xi]
     
     def is_transition_safe(self, x1, y1, x2, y2, step_px=0.5):
-        """
-        Optimized version that checks if the path from (x1,y1) to (x2,y2) is safe
-        """
-        dx = x2 - x1
-        dy = y2 - y1
-        distance = math.hypot(dx, dy)
+        """Optimized path safety check"""
+        # Convert positions to array indices
+        x1_idx = int(np.clip(x1, 0, self.dem_shape[1]-1))
+        y1_idx = int(np.clip(y1, 0, self.dem_shape[0]-1))
+        x2_idx = int(np.clip(x2, 0, self.dem_shape[1]-1))
+        y2_idx = int(np.clip(y2, 0, self.dem_shape[0]-1))
         
-        # Quick check: if distance is very small, just check endpoints
-        if distance < step_px:
-            return self.check_all_directions_slopes(x1, y1) and self.check_all_directions_slopes(x2, y2)
-        
-        steps = max(1, int(distance / step_px))
-        
-        # Check start and end first - most common failure points
-        if not (self.check_all_directions_slopes(x1, y1) and self.check_all_directions_slopes(x2, y2)):
+        # Check endpoints
+        if not (self.safety_map[y1_idx, x1_idx] and self.safety_map[y2_idx, x2_idx]):
             return False
         
-        # If only a few steps, check them all
-        if steps <= 3:
-            for i in range(1, steps):
-                t = i / steps
-                xi = x1 + t * dx
-                yi = y1 + t * dy
-                if not self.check_all_directions_slopes(xi, yi):
-                    return False
-            return True
-        
-        # For longer paths, check fewer intermediate points
-        # Check middle point and 1/4, 3/4 points
-        checkpoints = [0.25, 0.5, 0.75]
-        for t in checkpoints:
-            xi = x1 + t * dx
-            yi = y1 + t * dy
-            if not self.check_all_directions_slopes(xi, yi):
+        # Check intermediate points using Bresenham's line algorithm
+        line_points = list(zip(*self._bresenham_line(x1_idx, y1_idx, x2_idx, y2_idx)))
+        for x, y in line_points:
+            if not self.safety_map[y, x]:
                 return False
-        
         return True
 
-    # def astar_path(self, start, goal):
-    #     """Highly optimized A* implementation"""
-    #     # Early exit if start == goal
-    #     if start == goal:
-    #         return [start]
+    def _bresenham_line(self, x0, y0, x1, y1):
+        """Bresenham's line algorithm for accurate grid sampling"""
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        x, y = x0, y0
+        sx = -1 if x0 > x1 else 1
+        sy = -1 if y0 > y1 else 1
+        err = dx - dy
+        line = []
         
-    #     # Use a more efficient distance calculation
-    #     def octile_distance(a, b):
-    #         dx = abs(a[1] - b[1])
-    #         dy = abs(a[0] - b[0])
-    #         return max(dx, dy) + (math.sqrt(2) - 1) * min(dx, dy)
-        
-    #     # Create numpy array for visited nodes (much faster than dict lookups)
-    #     visited = np.zeros(self.dem_shape, dtype=bool)
-    #     # Create cost array initialized to infinity
-    #     cost_array = np.full(self.dem_shape, np.inf)
-    #     cost_array[start] = 0
-        
-    #     # Cardinal and diagonal movements with precalculated costs
-    #     neighbors = np.array([(-1, 0), (1, 0), (0, -1), (0, 1),
-    #                         (-1, -1), (-1, 1), (1, -1), (1, 1)])
-    #     costs = np.array([1.0, 1.0, 1.0, 1.0, math.sqrt(2), math.sqrt(2), math.sqrt(2), math.sqrt(2)])
-        
-    #     # Initialize priority queue with (f_score, tiebreaker, node_y, node_x)
-    #     open_set = [(octile_distance(start, goal), 0, start[0], start[1])]
-    #     # Dictionary for backtracking
-    #     came_from = {}
-    #     counter = 0  # Tiebreaker for equal f-scores
-        
-    #     # Precompute goal coordinates for faster access
-    #     goal_y, goal_x = goal
-        
-    #     # For slope safety check optimization
-    #     max_slope_tan = math.tan(math.radians(self.max_slope_deg))
-        
-    #     while open_set:
-    #         # Pop node with lowest f_score
-    #         _, _, cy, cx = heappop(open_set)
-    #         current = (cy, cx)
-            
-    #         # Goal check
-    #         if current == goal:
-    #             # Reconstruct path
-    #             path = []
-    #             while current in came_from:
-    #                 path.append(current)
-    #                 current = came_from[current]
-    #             path.append(start)
-    #             return path[::-1]  # Faster than path.reverse()
-            
-    #         # Mark as visited
-    #         visited[cy, cx] = True
-    #         current_cost = cost_array[cy, cx]
-            
-    #         # Check all neighbors at once
-    #         for i, (dy, dx) in enumerate(neighbors):
-    #             ny, nx = cy + dy, cx + dx
-                
-    #             # Skip if out of bounds or already visited
-    #             if (ny < 0 or ny >= self.dem_shape[0] or 
-    #                 nx < 0 or nx >= self.dem_shape[1] or 
-    #                 visited[ny, nx]):
-    #                 continue
-                
-    #             # Quick slope check using precomputed gradients
-    #             # This avoids calling the expensive is_transition_safe for all neighbors
-    #             x_mid = (cx + nx) / 2
-    #             y_mid = (cy + ny) / 2
-    #             xi, yi = int(x_mid), int(y_mid)
-    #             xi = min(max(xi, 0), self.dem_shape[1] - 2)
-    #             yi = min(max(yi, 0), self.dem_shape[0] - 2)
-                
-    #             # Direction vector in pixels
-    #             dx_px = nx - cx
-    #             dy_px = ny - cy
-    #             dist_px = math.sqrt(dx_px**2 + dy_px**2)
-                
-    #             # Convert to meters
-    #             dx_m = dx_px * self.x_res
-    #             dy_m = dy_px * self.y_res
-    #             dist_m = math.sqrt(dx_m**2 + dy_m**2)
-                
-    #             # Normalize
-    #             dx_norm = dx_m / dist_m if dist_m > 1e-9 else 0
-    #             dy_norm = dy_m / dist_m if dist_m > 1e-9 else 0
-                
-    #             # Quick slope check
-    #             slope = dx_norm * self.grad_x[yi, xi] + dy_norm * self.grad_y[yi, xi]
-    #             if abs(slope) > max_slope_tan:
-    #                 continue
-                
-    #             # Only perform expensive check if quick check passes
-    #             if not self.is_transition_safe(cx, cy, nx, ny):
-    #                 continue
-                
-    #             # Calculate new cost
-    #             new_cost = current_cost + costs[i]
-                
-    #             # If better path found
-    #             if new_cost < cost_array[ny, nx]:
-    #                 # Update tracking information
-    #                 came_from[(ny, nx)] = current
-    #                 cost_array[ny, nx] = new_cost
-    #                 f_score = new_cost + octile_distance((ny, nx), goal)
-    #                 counter += 1
-    #                 heappush(open_set, (f_score, counter, ny, nx))
-        
-    #     return None  # No path found
+        while True:
+            line.append((x, y))
+            if x == x1 and y == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+        return line
 
-    def astar_path(self, start, goal):
-        """Optimized A* implementation with meter-based slope checks"""
-        if start == goal:
-            # Add cold region check for start position
-            if self.cold_region_mask[start[1], start[0]]:
-                return None
-            return [start]
+    def _is_transition_safe_rc(self, row1, col1, row2, col2, step_px=0.5):
+        """
+        Same slope check, but expects (row1, col1) instead of (x1, y1).
+        Internally we call self.is_transition_safe(x1, y1, x2, y2).
+        """
+        # Convert row,col -> x,y
+        x1, y1 = float(col1), float(row1)
+        x2, y2 = float(col2), float(row2)
+        return self.is_transition_safe(x1, y1, x2, y2, step_px=step_px)
+        
+    def _reconstruct_path_rc(self, came_from, current):
+        path = [current]
+        while current in came_from:
+            current = came_from[current]
+            path.append(current)
+        return path[::-1]
 
-        # Precompute max slope tangent
-        max_slope_tan = math.tan(math.radians(self.max_slope_deg))
-        
-        # Use heap dictionary for efficient priority updates
-        open_set = []
-        heappush(open_set, (0, 0, start[0], start[1]))
-        
+    def astar_path(self, start_rc, goal_rc):
+        """
+        Optimized A* pathfinding with precomputed safety map and meter-accurate checks
+        Returns list of (row, col) coordinates from start_rc to goal_rc
+        """
+        if start_rc == goal_rc:
+            return [start_rc] if self.safety_map[start_rc] else None
+
+        # Precompute directions with costs (meters)
+        neighbors = [
+            (-1, 0, self.y_res),  # Up
+            (1, 0, self.y_res),   # Down
+            (0, -1, self.x_res),  # Left
+            (0, 1, self.x_res),   # Right
+            (-1, -1, math.hypot(self.x_res, self.y_res)),  # Diagonals
+            (-1, 1, math.hypot(self.x_res, self.y_res)),
+            (1, -1, math.hypot(self.x_res, self.y_res)),
+            (1, 1, math.hypot(self.x_res, self.y_res)),
+        ]
+
+        # Initialize data structures
+        open_heap = []
         came_from = {}
         g_score = np.full(self.dem_shape, np.inf)
-        g_score[start] = 0
         f_score = np.full(self.dem_shape, np.inf)
-        f_score[start] = self._heuristic(start, goal)
-        visited = np.zeros(self.dem_shape, dtype=bool)
-        counter = 0
+        
+        # Convert start/goal to array indices
+        start_y, start_x = start_rc
+        goal_y, goal_x = goal_rc
+        
+        # Initialize starting node
+        g_score[start_y, start_x] = 0
+        f_score[start_y, start_x] = self._heuristic(start_rc, goal_rc)
+        heappush(open_heap, (f_score[start_y, start_x], 0, start_y, start_x))
 
-        while open_set:
-            current = heappop(open_set)[2:]
-            current_pos = (current[1], current[0])  # (y, x)
+        # Precompute safety check thresholds
+        max_slope_tan = math.tan(math.radians(self.max_slope_deg))
+        safe_cells = np.where(self.safety_map)
+        
+        while open_heap:
+            current_f, _, cy, cx = heappop(open_heap)
             
-            if current_pos == goal:
-                return self._reconstruct_path(came_from, current_pos)
-
-            if visited[current[1], current[0]]:
+            # Early exit if goal reached
+            if (cy, cx) == (goal_y, goal_x):
+                return self._reconstruct_path_rc(came_from, (cy, cx))
+            
+            # Skip processed nodes
+            if current_f > f_score[cy, cx]:
                 continue
-            visited[current[1], current[0]] = True
-
-            # Generate neighbors with costs
-            for dx, dy, cost in [(-1,0,1), (1,0,1), (0,-1,1), (0,1,1),
-                                (-1,-1,math.sqrt(2)), (-1,1,math.sqrt(2)),
-                                (1,-1,math.sqrt(2)), (1,1,math.sqrt(2))]:
-                nx = current[0] + dx
-                ny = current[1] + dy
                 
-                if not (0 <= nx < self.dem_shape[1] and 0 <= ny < self.dem_shape[0]):
+            for dy, dx, step_cost in neighbors:
+                ny = cy + dy
+                nx = cx + dx
+                
+                # Boundary check
+                if not (0 <= ny < self.dem_shape[0] and 0 <= nx < self.dem_shape[1]):
                     continue
                     
-                # Check cold regions and slope safety
-                if self.cold_region_mask[ny, nx] or not self.is_transition_safe(
-                    current[0], current[1], nx, ny, step_px=0.5):
+                # Fast safety check
+                if not self.safety_map[ny, nx]:
                     continue
-
-                tentative_g = g_score[current[1], current[0]] + cost
+                    
+                # Detailed transition check in meters
+                if not self._safe_transition_meters((cy, cx), (ny, nx)):
+                    continue
+                    
+                # Calculate tentative g-score
+                tentative_g = g_score[cy, cx] + step_cost
+                
                 if tentative_g < g_score[ny, nx]:
-                    came_from[(ny, nx)] = current_pos
+                    came_from[(ny, nx)] = (cy, cx)
                     g_score[ny, nx] = tentative_g
-                    f_score[ny, nx] = tentative_g + self._heuristic((nx, ny), goal)
-                    counter += 1
-                    heappush(open_set, (f_score[ny, nx], counter, nx, ny))
+                    f_score[ny, nx] = tentative_g + self._heuristic((ny, nx), goal_rc)
+                    heappush(open_heap, (f_score[ny, nx], id((ny, nx)), ny, nx))
 
-        return None
+        return None  # No path found
+    
+    def _safe_transition_meters(self, from_rc, to_rc):
+        """Check transition safety using Bresenham's line algorithm in meters"""
+        line = self._bresenham_line(from_rc[1], from_rc[0], to_rc[1], to_rc[0])
+        for x, y in line:
+            if not self.safety_map[y, x]:
+                return False
+        return True
     
     def _heuristic(self, a, b):
-        """Octile distance heuristic"""
-        dx = abs(a[0] - b[0])
-        dy = abs(a[1] - b[1])
-        return max(dx, dy) + (math.sqrt(2)-1)*min(dx, dy)
+        """Meter-accurate octile distance heuristic"""
+        dx = abs(a[1] - b[1]) * self.x_res
+        dy = abs(a[0] - b[0]) * self.y_res
+        return max(dx, dy) + (math.sqrt(2)-1) * min(dx, dy)
 
     def _reconstruct_path(self, came_from, current):
         path = []
@@ -755,65 +619,6 @@ class LunarRover3DEnv(gym.Env):
         obs = self.get_observation()
         return obs, {}
 
-    # def step(self, action):
-    #     x, y, theta = self.state
-    #     turn, forward = action
-    #     theta += turn
-
-    #     # Skip interpolation for small movements
-    #     if forward <= 0.1:
-    #         new_x = x + forward * math.cos(theta)
-    #         new_y = y + forward * math.sin(theta)
-    #         new_x = np.clip(new_x, 0, self.dem_shape[1] - 1)
-    #         new_y = np.clip(new_y, 0, self.dem_shape[0] - 1)
-            
-    #         # Check slopes at the destination point
-    #         if not self.check_all_directions_slopes(new_x, new_y):
-    #             self.state = np.array([new_x, new_y, theta], dtype=np.float32)
-    #             return self.get_observation(), -50.0, True, False, {}
-                
-    #         self.state = np.array([new_x, new_y, theta], dtype=np.float32)
-    #     else:
-    #         # Interpolate movement into smaller steps for longer movements
-    #         step_size = 0.2  # Larger step size than before (0.1)
-    #         steps = max(int(forward / step_size), 1)
-            
-    #         for i in range(steps):
-    #             partial_forward = (i + 1) * step_size
-    #             new_x = x + min(partial_forward, forward) * math.cos(theta)
-    #             new_y = y + min(partial_forward, forward) * math.sin(theta)
-    #             new_x = np.clip(new_x, 0, self.dem_shape[1] - 1)
-    #             new_y = np.clip(new_y, 0, self.dem_shape[0] - 1)
-                
-    #             # Check slopes
-    #             if not self.check_all_directions_slopes(new_x, new_y):
-    #                 self.state = np.array([new_x, new_y, theta], dtype=np.float32)
-    #                 return self.get_observation(), -50.0, True, False, {}
-                    
-    #             # Update position for next step
-    #             x, y = new_x, new_y
-                
-    #         # Update final state
-    #         self.state = np.array([x, y, theta], dtype=np.float32)
-
-    #     # Reward calculation
-    #     reward = -0.1
-        
-    #     # Check goal
-    #     gx, gy = self.goal
-    #     dx_m = (x - gx) * self.x_res
-    #     dy_m = (y - gy) * self.y_res
-    #     dist_to_goal_m = np.linalg.norm([dx_m, dy_m])
-        
-    #     if dist_to_goal_m < self.goal_radius_m:
-    #         reward += 100.0
-    #         done = True
-    #     else:
-    #         self.current_step += 1
-    #         done = (self.current_step >= self.max_steps)
-
-    #     return self.get_observation(), reward, done, False, {}
-
     def step(self, action):
         prev_state = np.copy(self.state)
         turn, forward = action
@@ -851,20 +656,12 @@ class LunarRover3DEnv(gym.Env):
             done = True
 
         return self.get_observation(), reward, done, False, {}
-    
+
     def _in_cold_region(self, x, y):
-        """Sub-pixel accurate cold region check"""
-        xi, yi = int(x), int(y)
-        if xi < 0 or xi >= self.dem_shape[1]-1 or yi < 0 or yi >= self.dem_shape[0]-1:
-            return False
-        
-        # Bilinear interpolation of cold region mask
-        dx = x - xi
-        dy = y - yi
-        return any(
-            self.cold_region_mask[yi+yoff, xi+xoff] * (1-dx if xoff==0 else dx) * (1-dy if yoff==0 else dy)
-            for xoff in [0,1] for yoff in [0,1]
-        )
+        """Fast cold region check"""
+        xi = int(round(np.clip(x, 0, self.dem_shape[1]-1)))
+        yi = int(round(np.clip(y, 0, self.dem_shape[0]-1)))
+        return self.cold_region_mask[yi, xi]
 
     def _calculate_distance_reward(self, prev_state):
         """Calculate scaled reward based on distance improvement"""
@@ -886,90 +683,29 @@ class LunarRover3DEnv(gym.Env):
     # -------------------------------------------------------------------------
     # Rendering
     # -------------------------------------------------------------------------
-    # def render(self, mode='human', show_path=False, save_frames=False):
-    #     """
-    #     Renders the environment using PyVista. 
-    #     If 'show_path=True' and self.path_found is not None, draws the path in 3D.
-    #     """
-    #     if self.plotter is None:
-    #         self.plotter = pv.Plotter(window_size=(1024, 768))
-    #     else:
-    #         self.plotter.clear()
 
-    #     # Create structured grid
-    #     grid = pv.StructuredGrid(self.X, self.Y, self.dem)
-    #     self.plotter.add_mesh(grid, cmap="Blues_r", show_scalar_bar=True)
+    def _add_astar_path_mesh(self, path):
+        """
+        Draws the A* path as a polyline above the terrain.
+        path is a list of (row, col) = (y, x).
+        """
+        pts = []
+        for (ry, cx) in path:
+            x_m = cx * self.x_res
+            y_m = ry * self.y_res
+            z_m = self.dem[ry, cx] + 10  # slightly above
+            pts.append([x_m, y_m, z_m])
+        pts = np.array(pts, dtype=np.float32)
 
-    #     # Rover
-    #     x_px, y_px, theta = self.state
-    #     x_m = x_px * self.x_res
-    #     y_m = y_px * self.y_res
-    #     z_m = self.get_height(x_px, y_px)
-
-    #     rover = pv.Plane(
-    #         center=(x_m, y_m, z_m + 5),
-    #         direction=(0,0,1),
-    #         i_size=1000, 
-    #         j_size=1000
-    #     )
-    #     rover.rotate_z(np.degrees(theta), inplace=True)
-    #     self.plotter.add_mesh(rover, color="red")
-
-    #     # Goal
-    #     gx_px, gy_px = self.destination
-    #     gx_m = gx_px * self.x_res
-    #     gy_m = gy_px * self.y_res
-    #     gz_m = self.get_height(gx_px, gy_px)
-    #     goal_marker = pv.Sphere(radius=1000, center=(gx_m, gy_m, gz_m))
-    #     self.plotter.add_mesh(goal_marker, color="green")
-
-    #     # Optionally draw the A* path
-    #     if show_path and self.path_found is not None:
-    #         self._add_astar_path_mesh(self.path_found)
-
-    #     # Camera
-    #     offset = 150000
-    #     self.plotter.camera_position = [
-    #         (x_m + offset, y_m + offset, z_m + offset),  # camera location
-    #         (x_m, y_m, z_m),                             # look at rover
-    #         (0, 0, 1)                                    # up vector
-    #     ]
-
-    #     # self.plotter = pv.Plotter(window_size=(1024, 768))
-    #     #self.plotter.enable_terrain_style()  # Optional: Better visualization
-    #     self.plotter.show_grid(
-    #         xtitle="X (meters)",
-    #         ytitle="Y (meters)",
-    #         ztitle="Elevation (meters)",
-    #     )
-
-    #     if save_frames:
-    #         return self.plotter.screenshot()
-    #     else:
-    #         self.plotter.show()
-
-    # def _add_astar_path_mesh(self, path):
-    #     """
-    #     Draws the A* path as a polyline above the terrain.
-    #     path is a list of (row, col) = (y, x).
-    #     """
-    #     pts = []
-    #     for (ry, cx) in path:
-    #         x_m = cx * self.x_res
-    #         y_m = ry * self.y_res
-    #         z_m = self.dem[ry, cx] + 10  # slightly above
-    #         pts.append([x_m, y_m, z_m])
-    #     pts = np.array(pts, dtype=np.float32)
-
-    #     poly = pv.PolyData()
-    #     poly.points = pts
-    #     lines = []
-    #     for i in range(len(pts)-1):
-    #         lines.append(2)
-    #         lines.append(i)
-    #         lines.append(i+1)
-    #     poly.lines = np.array(lines)
-    #     self.plotter.add_mesh(poly, color='yellow', line_width=5)
+        poly = pv.PolyData()
+        poly.points = pts
+        lines = []
+        for i in range(len(pts)-1):
+            lines.append(2)
+            lines.append(i)
+            lines.append(i+1)
+        poly.lines = np.array(lines)
+        self.plotter.add_mesh(poly, color='yellow', line_width=5)
 
     def render(self, mode='human', show_path=False, save_frames=False):
         """
