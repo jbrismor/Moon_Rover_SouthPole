@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="Moon_env",
+    name="Moon_Rover",
     version="1.0.0",
     packages=find_packages(where="src"),
     include_package_data=True,
@@ -16,7 +16,6 @@ setup(
         "Pillow",
         "torch",
         "pyvista",
-        "heapq",
         "rasterio"
     ],
     description="Moon Rover motion RL environment",

@@ -1,0 +1,10 @@
+gymnasium
+numpy
+pygame
+matplotlib
+scipy
+noise
+Pillow
+torch
+pyvista
+rasterio

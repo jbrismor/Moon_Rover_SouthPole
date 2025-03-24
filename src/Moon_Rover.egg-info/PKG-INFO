@@ -1,0 +1,21 @@
+Metadata-Version: 2.2
+Name: Moon_Rover
+Version: 1.0.0
+Summary: Moon Rover motion RL environment
+Author: Jorge Bris Moreno
+License: MIT
+License-File: LICENSE
+Requires-Dist: gymnasium
+Requires-Dist: numpy
+Requires-Dist: pygame
+Requires-Dist: matplotlib
+Requires-Dist: scipy
+Requires-Dist: noise
+Requires-Dist: Pillow
+Requires-Dist: torch
+Requires-Dist: pyvista
+Requires-Dist: rasterio
+Dynamic: author
+Dynamic: license
+Dynamic: requires-dist
+Dynamic: summary

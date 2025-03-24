@@ -38,7 +38,7 @@ class LunarRover3DEnv(gym.Env):
                 goal_radius_m=50,
                 num_cold_regions=3,
                 cold_region_scale=20,
-                distance_reward_scale=0.02):
+                distance_reward_scale=0.08):
         super().__init__()
 
         self.render_mode = render_mode
@@ -734,13 +734,13 @@ class LunarRover3DEnv(gym.Env):
         y_m = y_px * self.y_res
         z_m = self.get_height(x_px, y_px)
 
-        rover = pv.Plane(
-            center=(x_m, y_m, z_m + 5),
-            direction=(0,0,1),
-            i_size=1000, 
-            j_size=1000
+        # Create a sphere with a specified center and radius
+        rover = pv.Sphere(
+            center=(x_m, y_m, z_m + 5),  # Adjust z offset as needed
+            radius=1000                # Change radius value to suit your rover size
         )
-        rover.rotate_z(np.degrees(theta), inplace=True)
+
+        # Note: A sphere is symmetric so a rotation based on theta is not necessary.
         self.plotter.add_mesh(rover, color="red")
 
         # Goal
@@ -770,7 +770,7 @@ class LunarRover3DEnv(gym.Env):
         )
 
         if save_frames:
-            return self.plotter.screenshot()
+            return self.plotter.screenshot(return_img=True)
         else:
             self.plotter.show()
 
