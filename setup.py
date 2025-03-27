@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="Moon_Rover",
-    version="1.0.0",
+    version="1.1.1",
     packages=find_packages(where="src"),
     include_package_data=True,
     package_dir={"": "src"},
