@@ -28,12 +28,12 @@ class LunarRover3DEnv(gym.Env):
                 goal_radius_m=50,
                 num_cold_regions=3,
                 cold_region_scale=50,
-                distance_reward_scale=0.08,
+                distance_reward_scale=0.5,
                 max_num_steps=10000,
                 radius_render=100,
                 cold_region_locations=None,
                 forward_speed = 10.0,
-                step_penalty =  -0.001,
+                step_penalty =  -0.01,
                 cold_penalty = -100.0,
                 slope_penalty = -10.0
                 ):  # Modified parameter
@@ -107,15 +107,31 @@ class LunarRover3DEnv(gym.Env):
 
         # Define observation and action spaces
         obs_low = np.array([
-            0.0, -1.0, 0.0, *[0.0]*16, 0.0, -1.0], dtype=np.float32)
+            0.0,   # normalized_distance
+            -1.0,  # relative_angle_normalized (already [-1,1])
+            0.0,   # current_incl (now [0,1])
+            *[0.0]*16,  # surrounding slopes (now [0,1])
+            0.0,   # scaled_dist
+            -1.0   # scaled_angle (already [-1,1])
+        ], dtype=np.float32)
+
         obs_high = np.array([
-            1.0, 1.0, 90.0, *[90.0]*16, 1.0, 1.0], dtype=np.float32)
+            1.0,   # normalized_distance
+            1.0,   # relative_angle_normalized
+            1.0,   # current_incl (max 90° → 1.0)
+            *[1.0]*16,  # surrounding slopes (max 90° → 1.0)
+            1.0,   # scaled_dist
+            1.0    # scaled_angle
+        ], dtype=np.float32)
         
         self.observation_space = spaces.Box(obs_low, obs_high, dtype=np.float32)
         self.action_space = spaces.Box(
             low=np.array([-np.pi, 0.0], dtype=np.float32),
             high=np.array([np.pi, 1.0], dtype=np.float32)
         )
+
+        print("Observation space:", self.observation_space)
+        print("Action space:", self.action_space)
 
         self.state = None
         self.max_steps = max_num_steps
@@ -179,16 +195,49 @@ class LunarRover3DEnv(gym.Env):
             self._add_cold_region(mean_x, mean_y)
             print(f"Added random cold region at pixel ({mean_x:.1f}, {mean_y:.1f})")
 
-    def _initialize_environment(self, destination):
-        """Initialize spawn and destination points"""
-        # Find safe spawn considering cold regions
-        self.spawn = self.find_safe_spawn_point(
-            (self.dem_shape[1]-1)/4, 
-            (self.dem_shape[0]-1)*0.28)
+    # def _initialize_environment(self, destination):
+    #     """Initialize spawn and destination points"""
+    #     # Find safe spawn considering cold regions
+    #     self.spawn = self.find_safe_spawn_point(
+    #         (self.dem_shape[1]-1)/4, 
+    #         (self.dem_shape[0]-1)*0.28)
         
-        # Set destination
+    #     # Set destination
+    #     self.destination = destination if destination else self.compute_reachable_destination_from_spawn(self.spawn)
+    #     print(f"Spawn: {self.spawn}, Destination: {self.destination}")
+
+    def _initialize_environment(self, destination):
+        """Initialize spawn and destination points with guaranteed safety"""
+        # Try multiple quadrants to find safe spawn
+        initial_points = [
+            ((self.dem_shape[1]-1)*0.25, (self.dem_shape[0]-1)*0.25),  # NW quadrant
+            ((self.dem_shape[1]-1)*0.75, (self.dem_shape[0]-1)*0.25),  # NE quadrant
+            ((self.dem_shape[1]-1)*0.25, (self.dem_shape[0]-1)*0.75),  # SW quadrant
+            ((self.dem_shape[1]-1)*0.75, (self.dem_shape[0]-1)*0.75),  # SE quadrant
+        ]
+
+        for attempt, (init_x, init_y) in enumerate(initial_points):
+            # Find safe spawn with larger search radius (50 pixels)
+            self.spawn = self.find_safe_spawn_point(init_x, init_y, search_radius=50)
+            
+            # Verify spawn safety
+            if self.check_all_directions_slopes(*self.spawn) and \
+                not self._in_cold_region(*self.spawn):
+                print(f"Found safe spawn at {self.spawn} (attempt {attempt+1})")
+                break
+        else:
+            raise RuntimeError("Could not find any safe spawn point after multiple attempts!")
+
+        # Ensure destination is reachable from spawn
         self.destination = destination if destination else self.compute_reachable_destination_from_spawn(self.spawn)
-        print(f"Spawn: {self.spawn}, Destination: {self.destination}")
+
+        # Validate path existence
+        if not self.check_path_possible(self.spawn, self.destination):
+            print("Warning: Initial destination unreachable! Finding alternative...")
+            self.destination = self.compute_reachable_destination_from_spawn(self.spawn)
+
+        print(f"Final spawn: {self.spawn}, Final destination: {self.destination}")
+        print(f"Path exists: {bool(self.check_path_possible(self.spawn, self.destination))}")
 
     # -------------------------------------------------------------------------
     # Slope / Height Utilities
@@ -279,7 +328,7 @@ class LunarRover3DEnv(gym.Env):
         return slopes
 
     
-    def find_safe_spawn_point(self, initial_spawn_x, initial_spawn_y, search_radius=10):
+    def find_safe_spawn_point(self, initial_spawn_x, initial_spawn_y, search_radius=30):
         """
         Find a nearby safe spawn point if the initial one isn't suitable.
         Searches in expanding circles around the initial point.
@@ -299,7 +348,7 @@ class LunarRover3DEnv(gym.Env):
         # Search in expanding circles
         for radius in range(1, search_radius + 1):
             # Check points in a circle around the initial spawn
-            for angle in range(0, 360, 10):  # Check every 10 degrees
+            for angle in range(0, 360, 5):  # Check every 10 degrees
                 rad = math.radians(angle)
                 x = initial_spawn_x + radius * math.cos(rad)
                 y = initial_spawn_y + radius * math.sin(rad)
@@ -397,7 +446,9 @@ class LunarRover3DEnv(gym.Env):
         delta_x_m = delta_x_px * self.x_res
         delta_y_m = delta_y_px * self.y_res
         distance_m = math.hypot(delta_x_m, delta_y_m)
-        normalized_distance = distance_m / self.max_distance_m  # Scale to [0, 1]
+
+        # --- Map-Based Normalization ---
+        normalized_distance = np.clip(distance_m / self.max_distance_m, 0.0, 1.0)
         
         # Angle to destination in global coordinates (radians)
         angle_to_dest = math.atan2(delta_y_m, delta_x_m)
@@ -419,16 +470,20 @@ class LunarRover3DEnv(gym.Env):
         scaled_dist = near_dist / self.max_distance_m
         scaled_angle = near_angle / np.pi
         
+        # Normalize current inclination and surrounding slopes
+        current_incl_norm = current_incl / 90.0
+        current_surrounding_norm = [s / 90.0 for s in current_surrounding]
+        next_step_surrounding_norm = [s / 90.0 for s in next_step_surrounding]
+
         return np.array([
             normalized_distance,
             relative_angle_normalized,
-            current_incl,
-            *current_surrounding,  # 8 values
-            *next_step_surrounding,  # 8 values
+            current_incl_norm,
+            *current_surrounding_norm,
+            *next_step_surrounding_norm,
             scaled_dist,
             scaled_angle
         ], dtype=np.float32)
-
 
     def _get_nearest_cold_region_info(self, x, y, theta):
         """Get distance and angle to nearest cold region with proper scaling"""
@@ -741,63 +796,12 @@ class LunarRover3DEnv(gym.Env):
             
         return obs, {}
 
-    # def step(self, action):
-
-    #     forward_speed = self.forward_speed
-    #     step_penalty = self.step_penalty
-    #     cold_penalty = self.cold_penalty
-    #     slope_penalty = self.slope_penalty 
-    
-    #     prev_state = np.copy(self.state)
-    #     turn, forward = action
-    #     x, y, theta = self.state
-        
-    #     # 1. Scale forward action to realistic speed (10 meters per step)
-    #     forward_meters = forward * forward_speed # Now 0-10 meters per step
-    #     delta_x = (forward_meters * math.cos(theta)) / self.x_res  # Convert meters → pixels
-    #     delta_y = (forward_meters * math.sin(theta)) / self.y_res
-        
-    #     new_x = x + delta_x
-    #     new_y = y + delta_y
-    #     new_x = np.clip(new_x, 0, self.dem_shape[1]-1)
-    #     new_y = np.clip(new_y, 0, self.dem_shape[0]-1)
-    #     new_theta = (theta + turn) % (2 * np.pi)
-        
-    #     # 2. Validate entire movement path
-    #     if not self.is_transition_safe(x, y, new_x, new_y):
-    #         # 3. Crash type detection (slope or cold region)
-    #         path = self._bresenham_line(int(x), int(y), int(new_x), int(new_y))
-    #         cold_crash = any(
-    #             self._in_cold_region(cx, cy) 
-    #             for (cx, cy) in path
-    #         )
-    #         penalty = cold_penalty if cold_crash else slope_penalty
-    #         print(f"Crash: {'Cold region' if cold_crash else 'Steep slope'}")
-    #         return self.get_observation(), penalty, True, False, {}
-        
-    #     # 4. Update state only if path is safe
-    #     self.state = np.array([new_x, new_y, new_theta], dtype=np.float32)
-    #     self.current_step += 1
-        
-    #     # 5. Reward calculation
-    #     reward = step_penalty  # Step penalty
-    #     reward += self._calculate_distance_reward(prev_state)  # Distance-based reward
-        
-    #     # 6. Goal check
-    #     done, goal_reward = self._check_goal_condition()
-    #     reward += goal_reward
-        
-    #     # 7. Step limit check
-    #     if self.current_step >= self.max_steps:
-    #         done = True
-    #         print("Max steps reached!")
-        
-    #     return self.get_observation(), reward, done, False, {}
-
     def step(self, action):
         prev_state = np.copy(self.state)
         turn, forward = action
         x, y, theta = self.state
+
+        info = {}
         
         # 1. Scale forward action to realistic speed (20 meters per step)
         forward_meters = forward * self.forward_speed
@@ -841,8 +845,19 @@ class LunarRover3DEnv(gym.Env):
         if self.current_step >= self.max_steps:
             done = True
             print("Max steps reached!")
+
+        info["is_success"] = self._reached_goal()
         
-        return self.get_observation(), reward, done, False, {}
+        # return self.get_observation(), reward, done, False, {}, info
+        # Correct: returns 5 elements
+        return self.get_observation(), reward, done, False, info
+    
+    def _reached_goal(self):
+        """Helper method to check if goal was reached"""
+        gx, gy = self.destination
+        x, y, _ = self.state
+        dist = math.hypot((x - gx) * self.x_res, (y - gy) * self.y_res)
+        return dist < self.goal_radius_m
 
     def _in_cold_region(self, x, y):
         """Fast cold region check"""
@@ -861,15 +876,14 @@ class LunarRover3DEnv(gym.Env):
         return (prev_dist - new_dist) * self.distance_reward_scale
     
     def _check_goal_condition(self):
-        """Check if rover reached goal"""
-        gx, gy = self.destination
-        x, y, _ = self.state
-        dist = math.hypot((x - gx)*self.x_res, (y - gy)*self.y_res)
-        if dist < self.goal_radius_m:
+        """Check if rover reached goal using shared helper"""
+        if self._reached_goal():
+            gx, gy = self.destination
+            x, y, _ = self.state
+            dist = math.hypot((x - gx)*self.x_res, (y - gy)*self.y_res)
             print(f"GOAL REACHED! dist={dist:.2f} < {self.goal_radius_m} => +500 reward")
             return True, 500.0
-        else:
-            return False, 0.0
+        return False, 0.0
 
     # -------------------------------------------------------------------------
     # Rendering
@@ -913,79 +927,6 @@ class LunarRover3DEnv(gym.Env):
             lines.append(i+1)
         poly.lines = np.array(lines)
         self.plotter.add_mesh(poly, color=path_data['color'], line_width=8, render_lines_as_tubes=True)
-
-    # def render(self, mode='human', show_path=False, save_frames=False):
-    #     """
-    #     Renders the environment using PyVista.
-    #     If 'show_path=True' and self.path_found is not None, draws the path in 3D.
-    #     Cold regions are rendered in black.
-    #     """
-    #     if self.plotter is None:
-    #         self.plotter = pv.Plotter(window_size=(1024, 768))
-    #     else:
-    #         self.plotter.clear()
-
-    #     radius_render = self.radius_render
-
-    #     # Create structured grid for main DEM
-    #     grid = pv.StructuredGrid(self.X, self.Y, self.dem)
-    #     self.plotter.add_mesh(grid, cmap="Blues_r", show_scalar_bar=True)
-        
-    #     # Add cold regions in black
-    #     if hasattr(self, 'cold_region_mask'):
-    #         cold_z = np.where(self.cold_region_mask, self.dem, np.nan)
-    #         cold_grid = pv.StructuredGrid(self.X, self.Y, cold_z)
-    #         self.plotter.add_mesh(cold_grid, color='black', opacity=0.7)
-
-    #     # Rover
-    #     x_px, y_px, theta = self.state
-    #     x_m = x_px * self.x_res
-    #     y_m = y_px * self.y_res
-    #     z_m = self.get_height(x_px, y_px)
-
-    #     # Create a sphere with a specified center and radius
-    #     rover = pv.Sphere(
-    #         center=(x_m, y_m, z_m + 10),  # Adjust z offset as needed
-    #         radius=radius_render                # Change radius value to suit your rover size
-    #     )
-
-    #     # Note: A sphere is symmetric so a rotation based on theta is not necessary.
-    #     self.plotter.add_mesh(rover, color="red")
-
-    #     # Goal
-    #     gx_px, gy_px = self.destination
-    #     gx_m = gx_px * self.x_res
-    #     gy_m = gy_px * self.y_res
-    #     gz_m = self.get_height(gx_px, gy_px)
-    #     goal_marker = pv.Sphere(radius=radius_render, center=(gx_m, gy_m, gz_m))
-    #     self.plotter.add_mesh(goal_marker, color="green")
-
-    #     # Optionally draw the A* path
-    #     if show_path and self.path_found is not None:
-    #         self._add_astar_path_mesh(self.path_found)
-
-    #     # Camera setup remains unchanged
-    #     offset = 150000
-    #     self.plotter.camera_position = [
-    #         (x_m + offset, y_m + offset, z_m + offset),
-    #         (x_m, y_m, z_m),
-    #         (0, 0, 1)
-    #     ]
-
-    #     self.plotter.show_grid(
-    #         xtitle="X (meters)",
-    #         ytitle="Y (meters)",
-    #         ztitle="Elevation (meters)",
-    #     )
-
-    #     # Add agent paths
-    #     for path_data in self.agent_paths:
-    #         self._add_path_to_plotter(path_data)
-
-    #     if save_frames:
-    #         return self.plotter.screenshot(return_img=True)
-    #     else:
-    #         self.plotter.show()
 
     def set_plotter(self, plotter):
         """Let an external script attach its own PyVista plotter."""
@@ -1090,17 +1031,25 @@ class LunarRover3DEnv(gym.Env):
 
 if __name__ == "__main__":
     dem_file_path = "src/map/LDEM_80S_20MPP_ADJ.tiff"
-    subregion_window = (6000, 7000, 6000, 7000)
+    subregion_window = (5000, 7000, 5000, 7000)
     
     # Create environment with cold region at (29985m, 995m)
     env = LunarRover3DEnv(
-        dem_file_path,
-        radius_render=10,
-        subregion_window = subregion_window,
-        desired_distance_m=1000,
-        cold_region_scale=10,
-        # cold_region_locations=[(29985, 10000)] , # Now accepts meter coordinates
-        num_cold_regions=1
+        dem_path=dem_file_path,
+        subregion_window=subregion_window,
+        max_slope_deg=25,
+        smooth_sigma=None,
+        desired_distance_m=20000,  # <--- Increased distance
+        distance_reward_scale=0.15,
+        cold_region_scale=50,
+        num_cold_regions=3,
+        max_num_steps=5000,
+        forward_speed = 10.0,
+        step_penalty =  -0.001,
+        cold_penalty = -100.0,
+        slope_penalty = -10.0,
+        goal_radius_m=50,
+        cold_region_locations=[(29985, 10000)]
     )
     
     obs, _ = env.reset()

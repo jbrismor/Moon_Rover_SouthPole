@@ -1,3 +1,4 @@
 *.tif
 *.DS_Store
 *.tiff
+__pycache__
