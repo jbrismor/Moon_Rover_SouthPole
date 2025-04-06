@@ -35,10 +35,12 @@ class LunarRover3DEnv(gym.Env):
                 forward_speed = 10.0,
                 step_penalty =  -0.01,
                 cold_penalty = -100.0,
-                slope_penalty = -10.0
+                slope_penalty = -10.0,
+                goal_reward = 500
                 ):  # Modified parameter
         super().__init__()
 
+        self.goal_reward = goal_reward
         self.radius_render = radius_render
         self.render_mode = render_mode
         self.max_slope_deg = max_slope_deg
@@ -206,38 +208,127 @@ class LunarRover3DEnv(gym.Env):
     #     self.destination = destination if destination else self.compute_reachable_destination_from_spawn(self.spawn)
     #     print(f"Spawn: {self.spawn}, Destination: {self.destination}")
 
+    # def _initialize_environment(self, destination):
+    #     """Initialize spawn and destination points with guaranteed safety"""
+    #     # Try multiple quadrants to find safe spawn
+    #     initial_points = [
+    #         ((self.dem_shape[1]-1)*0.25, (self.dem_shape[0]-1)*0.25),  # NW quadrant
+    #         ((self.dem_shape[1]-1)*0.75, (self.dem_shape[0]-1)*0.25),  # NE quadrant
+    #         ((self.dem_shape[1]-1)*0.25, (self.dem_shape[0]-1)*0.75),  # SW quadrant
+    #         ((self.dem_shape[1]-1)*0.75, (self.dem_shape[0]-1)*0.75),  # SE quadrant
+    #     ]
+
+    #     for attempt, (init_x, init_y) in enumerate(initial_points):
+    #         # Find safe spawn with larger search radius (50 pixels)
+    #         self.spawn = self.find_safe_spawn_point(init_x, init_y, search_radius=50)
+            
+    #         # Verify spawn safety
+    #         if self.check_all_directions_slopes(*self.spawn) and \
+    #             not self._in_cold_region(*self.spawn):
+    #             print(f"Found safe spawn at {self.spawn} (attempt {attempt+1})")
+    #             break
+    #     else:
+    #         raise RuntimeError("Could not find any safe spawn point after multiple attempts!")
+
+    #     # Ensure destination is reachable from spawn
+    #     self.destination = destination if destination else self.compute_reachable_destination_from_spawn(self.spawn)
+
+    #     # Validate path existence
+    #     if not self.check_path_possible(self.spawn, self.destination):
+    #         print("Warning: Initial destination unreachable! Finding alternative...")
+    #         self.destination = self.compute_reachable_destination_from_spawn(self.spawn)
+
+    #     print(f"Final spawn: {self.spawn}, Final destination: {self.destination}")
+    #     print(f"Path exists: {bool(self.check_path_possible(self.spawn, self.destination))}")
+
     def _initialize_environment(self, destination):
-        """Initialize spawn and destination points with guaranteed safety"""
-        # Try multiple quadrants to find safe spawn
-        initial_points = [
-            ((self.dem_shape[1]-1)*0.25, (self.dem_shape[0]-1)*0.25),  # NW quadrant
-            ((self.dem_shape[1]-1)*0.75, (self.dem_shape[0]-1)*0.25),  # NE quadrant
-            ((self.dem_shape[1]-1)*0.25, (self.dem_shape[0]-1)*0.75),  # SW quadrant
-            ((self.dem_shape[1]-1)*0.75, (self.dem_shape[0]-1)*0.75),  # SE quadrant
+        """Initialize spawn and destination points with guaranteed safety and minimum distance"""
+        # Define the four corners of the subregion
+        initial_corners = [
+            (0, 0),  # NW corner (top-left)
+            (self.dem_shape[1]-1, 0),  # NE corner (top-right)
+            (0, self.dem_shape[0]-1),  # SW corner (bottom-left)
+            (self.dem_shape[1]-1, self.dem_shape[0]-1),  # SE corner (bottom-right)
         ]
 
-        for attempt, (init_x, init_y) in enumerate(initial_points):
-            # Find safe spawn with larger search radius (50 pixels)
-            self.spawn = self.find_safe_spawn_point(init_x, init_y, search_radius=50)
-            
-            # Verify spawn safety
-            if self.check_all_directions_slopes(*self.spawn) and \
-                not self._in_cold_region(*self.spawn):
-                print(f"Found safe spawn at {self.spawn} (attempt {attempt+1})")
+        # Try each corner to find a safe spawn
+        for corner in initial_corners:
+            init_x, init_y = corner
+            # Search widely around the corner for a safe spawn
+            self.spawn = self.find_safe_spawn_point(init_x, init_y, search_radius=100)
+            if self.check_all_directions_slopes(*self.spawn) and not self._in_cold_region(*self.spawn):
+                print(f"Found safe spawn near {corner} at {self.spawn}")
                 break
         else:
-            raise RuntimeError("Could not find any safe spawn point after multiple attempts!")
+            raise RuntimeError("No safe spawn found in any corner!")
 
-        # Ensure destination is reachable from spawn
-        self.destination = destination if destination else self.compute_reachable_destination_from_spawn(self.spawn)
+        # Calculate direction to opposite corner for maximum distance
+        spawn_x, spawn_y = self.spawn
+        target_x = self.dem_shape[1] - 1 - spawn_x  # Opposite X
+        target_y = self.dem_shape[0] - 1 - spawn_y  # Opposite Y
+        angle = math.atan2((target_y - spawn_y) * self.y_res, 
+                        (target_x - spawn_x) * self.x_res)
 
-        # Validate path existence
-        if not self.check_path_possible(self.spawn, self.destination):
-            print("Warning: Initial destination unreachable! Finding alternative...")
+        # Compute candidate destination at desired distance in this direction
+        desired_px_x = self.desired_distance_m / self.x_res * math.cos(angle)
+        desired_px_y = self.desired_distance_m / self.y_res * math.sin(angle)
+        candidate_x = spawn_x + desired_px_x
+        candidate_y = spawn_y + desired_px_y
+        candidate = (np.clip(candidate_x, 0, self.dem_shape[1]-1),
+                    np.clip(candidate_y, 0, self.dem_shape[0]-1))
+
+        # Check if candidate is valid and reachable
+        if self.check_all_directions_slopes(*candidate):
+            path = self.check_path_possible(self.spawn, candidate)
+            if path:
+                self.destination = candidate
+                self.path_found = path
+                print(f"Destination set to opposite corner: {self.destination}")
+            else:
+                print("Direct opposite path blocked. Finding alternative destination.")
+                self.destination = self.compute_reachable_destination_from_spawn(self.spawn)
+        else:
+            print("Opposite direction candidate unsafe. Finding alternative.")
             self.destination = self.compute_reachable_destination_from_spawn(self.spawn)
 
-        print(f"Final spawn: {self.spawn}, Final destination: {self.destination}")
-        print(f"Path exists: {bool(self.check_path_possible(self.spawn, self.destination))}")
+        # Enforce minimum distance requirement
+        gx, gy = self.destination
+        distance = math.hypot((gx - spawn_x)*self.x_res, (gy - spawn_y)*self.y_res)
+        if distance < self.desired_distance_m:
+            print(f"Warning: Actual distance {distance/1000:.1f} km < desired {self.desired_distance_m/1000} km")
+            # Attempt to find a further destination
+            self.destination = self._find_min_distance_destination(spawn_x, spawn_y)
+            if self.destination is None:
+                print("Could not find destination meeting minimum distance. Using best found.")
+
+    def _find_min_distance_destination(self, spawn_x, spawn_y):
+        """Find the farthest valid destination from spawn meeting the desired distance"""
+        angles = np.linspace(0, 360, 36)  # Check every 10 degrees
+        best_dist = 0
+        best_dest = None
+
+        for angle_deg in angles:
+            rad = math.radians(angle_deg)
+            dx = self.desired_distance_m / self.x_res * math.cos(rad)
+            dy = self.desired_distance_m / self.y_res * math.sin(rad)
+            candidate = (spawn_x + dx, spawn_y + dy)
+            candidate = (np.clip(candidate[0], 0, self.dem_shape[1]-1),
+                        np.clip(candidate[1], 0, self.dem_shape[0]-1))
+            
+            if not self.check_all_directions_slopes(*candidate):
+                continue
+
+            path = self.check_path_possible((spawn_x, spawn_y), candidate)
+            if path:
+                distance = math.hypot((candidate[0]-spawn_x)*self.x_res, 
+                                    (candidate[1]-spawn_y)*self.y_res)
+                if distance >= self.desired_distance_m:
+                    return candidate  # Found suitable destination
+                elif distance > best_dist:
+                    best_dist = distance
+                    best_dest = candidate
+
+        return best_dest if best_dist > 0 else None
 
     # -------------------------------------------------------------------------
     # Slope / Height Utilities
@@ -877,12 +968,13 @@ class LunarRover3DEnv(gym.Env):
     
     def _check_goal_condition(self):
         """Check if rover reached goal using shared helper"""
+        goal_reward = self.goal_reward
         if self._reached_goal():
             gx, gy = self.destination
             x, y, _ = self.state
             dist = math.hypot((x - gx)*self.x_res, (y - gy)*self.y_res)
-            print(f"GOAL REACHED! dist={dist:.2f} < {self.goal_radius_m} => +500 reward")
-            return True, 500.0
+            print(f"GOAL REACHED! dist={dist:.2f} < {self.goal_radius_m} => reward={goal_reward}")
+            return True, goal_reward
         return False, 0.0
 
     # -------------------------------------------------------------------------
@@ -1031,7 +1123,7 @@ class LunarRover3DEnv(gym.Env):
 
 if __name__ == "__main__":
     dem_file_path = "src/map/LDEM_80S_20MPP_ADJ.tiff"
-    subregion_window = (5000, 7000, 5000, 7000)
+    subregion_window = (4000, 9000, 4000, 9000)
     
     # Create environment with cold region at (29985m, 995m)
     env = LunarRover3DEnv(
@@ -1039,9 +1131,9 @@ if __name__ == "__main__":
         subregion_window=subregion_window,
         max_slope_deg=25,
         smooth_sigma=None,
-        desired_distance_m=20000,  # <--- Increased distance
+        desired_distance_m=100000,  # <--- Increased distance
         distance_reward_scale=0.15,
-        cold_region_scale=50,
+        cold_region_scale=100,
         num_cold_regions=3,
         max_num_steps=5000,
         forward_speed = 10.0,

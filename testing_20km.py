@@ -5,7 +5,7 @@ from Moon_Rover import LunarRover3DEnv
 import os
 from ray.tune.registry import register_env
 
-def env_creator(config):
+def lunar_rover_env_creator_longer(config):
 
     dem_path = config.get("dem_path", "/Users/jbm/Desktop/Moon_Rover_SouthPole/src/map/LDEM_80S_20MPP_ADJ.tiff")
     subregion_window = config.get("subregion_window", None)
@@ -15,24 +15,26 @@ def env_creator(config):
         subregion_window=subregion_window,
         max_slope_deg=25,
         smooth_sigma=None,
-        desired_distance_m=1000,
-        distance_reward_scale=0.5,
+        desired_distance_m=20000,
+        distance_reward_scale=0.8,
         step_penalty = -0.01,
-        cold_region_scale=10,
-        num_cold_regions=1,
+        cold_region_scale=50,
+        num_cold_regions=3,
         goal_radius_m=50,
-        max_num_steps=600,
+        max_num_steps=10000,
         cold_penalty = -100.0,
         slope_penalty = -20.0,
-        forward_speed = 10
+        forward_speed = 10,
+        cold_region_locations=[(29985, 10000)],
+        goal_reward=1000
     )
 
-register_env("LunarRover-v0", env_creator)
+register_env("LunarRoverLongDist-v0", lunar_rover_env_creator_longer)
 
 def test_policy(checkpoint_path):
     # Initialize plotter and environment
     plotter = pv.Plotter()
-    env = env_creator({})
+    env = lunar_rover_env_creator_longer({})
     env.set_plotter(plotter)
     
     # Load trained policy

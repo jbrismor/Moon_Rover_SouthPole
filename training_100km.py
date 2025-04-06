@@ -15,7 +15,7 @@ from ray.rllib.models import ModelCatalog
 from Moon_Rover import LunarRover3DEnv # NormalizeObservation
 import torch.nn as nn
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
-from beta_anneal_callback_20km import beta_anneal_callback_20km
+from beta_anneal_callback_100km import beta_anneal_callback_100km
 from ray.rllib.evaluation.metrics import collect_episodes, summarize_episodes
 
 def custom_metrics_fn(episodes):
@@ -31,7 +31,7 @@ def custom_metrics_fn(episodes):
 # 1) REGISTER NEW ENV: "LunarRoverLongDist-v0" #
 #    with a LONGER desired_distance_m            #
 ##################################################
-def lunar_rover_env_creator_longer(env_config):
+def lunar_rover_env_creator_longer100(env_config):
     """
     Example environment factory for a 'longer distance' scenario.
     Increase desired_distance_m from 1000 -> 2000, etc.
@@ -40,7 +40,7 @@ def lunar_rover_env_creator_longer(env_config):
         "dem_path",
         "/Users/jbm/Desktop/Moon_Rover_SouthPole/src/map/LDEM_80S_20MPP_ADJ.tiff"
     )
-    subregion_window = env_config.get("subregion_window", (5000, 7000, 5000, 7000))
+    subregion_window = env_config.get("subregion_window", (4000, 9000, 4000, 9000))
 
     # New environment with increased desired_distance_m and new params
     return LunarRover3DEnv(
@@ -48,22 +48,22 @@ def lunar_rover_env_creator_longer(env_config):
         subregion_window=subregion_window,
         max_slope_deg=25,
         smooth_sigma=None,
-        desired_distance_m=20000,
-        distance_reward_scale=1,
+        desired_distance_m=100000,
+        distance_reward_scale=1.25,
         step_penalty = -0.01,
-        cold_region_scale=50,
+        cold_region_scale=100,
         num_cold_regions=3,
         goal_radius_m=50,
-        max_num_steps=10000,
-        cold_penalty = -100.0,
-        slope_penalty = -50.0,
+        max_num_steps=100000,
+        cold_penalty = -150.0,
+        slope_penalty = -100.0,
         forward_speed = 10,
         cold_region_locations=[(29985, 10000)],
-        goal_reward=50000
+        goal_reward=100000
     )
 
 # Register the longer-distance variant under new name
-register_env("LunarRoverLongDist-v0", lunar_rover_env_creator_longer)
+register_env("LunarRoverLongDist-vlong", lunar_rover_env_creator_longer100)
 
 
 ##################################################
@@ -73,7 +73,7 @@ register_env("LunarRoverLongDist-v0", lunar_rover_env_creator_longer)
 def continue_training(
     checkpoint_path,
     stop_iters=10000,
-    new_checkpoint_dir="./checkpoints_20km"
+    new_checkpoint_dir="./checkpoints_100km"
 ):
     """
     Loads the SAC algorithm from an existing single-folder checkpoint
@@ -90,10 +90,10 @@ def continue_training(
         SACConfig()
         .api_stack(enable_rl_module_and_learner=False, enable_env_runner_and_connector_v2=False)
         .environment(
-            env="LunarRoverLongDist-v0",
+            env="LunarRoverLongDist-vlong",
             env_config={
                 "dem_path": "/Users/jbm/Desktop/Moon_Rover_SouthPole/src/map/LDEM_80S_20MPP_ADJ.tiff",
-                "subregion_window": (5000, 7000, 5000, 7000)
+                "subregion_window": (4000, 9000, 4000, 9000)
             }
         )
             .framework("torch")
@@ -147,7 +147,7 @@ def continue_training(
                     "beta": 0.2, # maybe increase
                     "epsilon": 1e-6,
                 },
-                num_steps_sampled_before_learning_starts=10000, # maybe increase to 50000
+                num_steps_sampled_before_learning_starts=50000, # maybe increase to 50000
                 target_entropy="auto",
                 n_step=5
             )
@@ -159,7 +159,7 @@ def continue_training(
                 evaluation_config={"explore": False, 
                                    "metrics_smoothing_episodes": 0,
                                    "custom_metrics_fn": custom_metrics_fn}
-            ).callbacks(beta_anneal_callback_20km) # maybe increase the steps more for the callback
+            ).callbacks(beta_anneal_callback_100km) # maybe increase the steps more for the callback
         )
 
     # 3) Build the SAC algorithm object
@@ -184,8 +184,8 @@ def continue_training(
     # Initialize plotting with 3 subplots
     plt.ion()
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-    live_plot_path = "continued_training_progress_live.png"
-    final_plot_path = "continued_training_progress_final.png"
+    live_plot_path = "100km_training_progress_live.png"
+    final_plot_path = "100km_training_progress_final.png"
 
     for i in range(stop_iters):
         result = algo.train()
@@ -263,13 +263,13 @@ def continue_training(
 ###################################
 if __name__ == "__main__":
     # This is the directory containing `algorithm_state.pkl`, `rllib_checkpoint.json`,
-    my_checkpoint_path = "/Users/jbm/Desktop/Moon_Rover_SouthPole/checkpoints"
+    my_checkpoint_path = "/Users/jbm/Desktop/Moon_Rover_SouthPole/checkpoints_20km"
 
     # Run additional training
     continue_training(
         checkpoint_path=my_checkpoint_path,
         stop_iters=10000,
-        new_checkpoint_dir="./checkpoints_20km"
+        new_checkpoint_dir="./checkpoints_100km"
     )
 
     print("Extended training complete.")
