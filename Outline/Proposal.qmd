@@ -70,6 +70,6 @@ At this point, we will have a fully functional rover that can navigate the terra
 ## Proposed algorithms
 
 - SAC
-- TD3
+- DreamerV3
 
 - If needed, policy network can be adjusted to a different architecture (but we propose to use it out of the box first).
