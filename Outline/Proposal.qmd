@@ -2,7 +2,6 @@
 title: 'Safe Automation on Moon Rover Exploration'
 authors:
   - Jorge Bris Moreno
-  - Billy McGloin
   - James Hickman
 format:
   html:
